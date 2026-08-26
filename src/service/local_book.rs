@@ -145,7 +145,7 @@ pub fn parse_epub(bytes: &[u8], toc_mode: &str) -> Result<ImportedBook> {
 
     // 6. toc 目录解析（toc.ncx EPUB2 / nav.xhtml EPUB3）并按模式合并章节顺序/标题
     let toc_entries = parse_epub_toc(&mut zip, &opf_path, &opf_str);
-    let chapters = merge_epub_chapters(&mut zip, &toc_entries, spin_chapters, toc_mode);
+    let chapters = merge_epub_chapters(&mut zip, &toc_entries, spin_chapters, toc_mode, &meta.title);
 
     Ok(ImportedBook {
         meta,
@@ -247,6 +247,10 @@ fn ncx_nav_points(xml: &str, ncx_path: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(false);
+    // 容错配置（同 parse_opf）：章节标题含裸 `&`（`Q&A 章`）或 navLabel 里塞不闭合内联标签
+    // 时，quick-xml 默认配置会报错中断 → 整个目录清空。放宽后畸形处保留原文、继续解析。
+    reader.config_mut().check_end_names = false;
+    reader.config_mut().allow_dangling_amp = true;
     let mut buf = Vec::new();
 
     // 结果按**文档顺序**（父先于子，深度优先）：进入 navPoint 时先占位，闭合时回填。
@@ -294,8 +298,39 @@ fn ncx_nav_points(xml: &str, ncx_path: &str) -> Vec<(String, String)> {
             }
             Ok(Event::Text(t)) => {
                 if in_text {
-                    if let Ok(s) = t.decode() {
-                        text_buf.push_str(&s);
+                    if let Ok(raw) = t.decode() {
+                        match quick_xml::escape::unescape(&raw) {
+                            Ok(s) => text_buf.push_str(&s),
+                            Err(_) => text_buf.push_str(&raw),
+                        }
+                    }
+                }
+            }
+            // quick-xml 0.41 把实体作为独立事件发出——缺这个分支会静默丢字符：
+            // `Tom &amp; Jerry`（合规写法）曾变成 "Tom  Jerry"、`caf&#233;` 变成 "caf"。
+            Ok(Event::GeneralRef(r)) => {
+                if in_text {
+                    match r.resolve_char_ref() {
+                        Ok(Some(c)) => text_buf.push(c),
+                        _ => {
+                            let name = String::from_utf8_lossy(r.as_ref()).to_string();
+                            let resolved = match name.as_str() {
+                                "amp" => "&",
+                                "lt" => "<",
+                                "gt" => ">",
+                                "quot" => "\"",
+                                "apos" => "'",
+                                "nbsp" => "\u{a0}",
+                                _ => "",
+                            };
+                            if resolved.is_empty() {
+                                text_buf.push('&');
+                                text_buf.push_str(&name);
+                                text_buf.push(';');
+                            } else {
+                                text_buf.push_str(resolved);
+                            }
+                        }
                     }
                 }
             }
@@ -343,11 +378,13 @@ fn ncx_nav_points(xml: &str, ncx_path: &str) -> Vec<(String, String)> {
 
 /// 按目录模式合并 spine 章节与 toc 目录（骨架 + 标题覆盖，对齐 legacy）
 /// toc_entries 的 href 为已解析的 zip 内完整路径（相对 zip 根），直接用于读取。
+/// `book_title`：OPF 书名——spine 标题若与书名雷同则视为无信息占位符（见 spin+toc 分支）
 fn merge_epub_chapters<R: std::io::Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     toc_entries: &[(String, String)],
     spin_chapters: Vec<(String, Chapter)>,
     toc_mode: &str,
+    book_title: &str,
 ) -> Vec<Chapter> {
     let mode = if is_epub_toc_mode(toc_mode) {
         toc_mode
@@ -359,9 +396,14 @@ fn merge_epub_chapters<R: std::io::Read + std::io::Seek>(
         return spin_chapters.into_iter().map(|(_, c)| c).collect();
     }
     match mode {
-        // spine 骨架：toc 标题覆盖（spin<toc 强制；spin+toc 仅当 spine 标题为空）
+        // spine 骨架：toc 标题覆盖（spin<toc 强制；spin+toc 仅当 spine 标题为空
+        // **或与书名雷同**）。
+        // 后半条针对 Calibre 等工具的产物：每个 XHTML 的 <title> 都被写成书名，
+        // spine 标题非空但零信息，若不覆盖会得到「64 章全叫《藏海花》」——
+        // 此时 toc 里的真实章名（第一章 起源…）才是用户要的。
         "spin<toc" | "spin+toc" => {
             let force = mode == "spin<toc";
+            let book_title = book_title.trim();
             let title_map: std::collections::HashMap<&str, &str> = toc_entries
                 .iter()
                 .map(|(h, t)| (h.as_str(), t.as_str()))
@@ -371,7 +413,9 @@ fn merge_epub_chapters<R: std::io::Read + std::io::Seek>(
                 .map(|(href, c)| {
                     let mut c = c;
                     if let Some(t) = title_map.get(href.as_str()) {
-                        if force || c.title.is_empty() {
+                        let placeholder =
+                            !book_title.is_empty() && c.title.trim() == book_title;
+                        if force || c.title.is_empty() || placeholder {
                             c.title = (*t).to_string();
                         }
                     }
@@ -1513,7 +1557,8 @@ pub fn parse_pdf(bytes: &[u8]) -> Result<ImportedBook> {
     let mut pages = Vec::with_capacity(limit);
     for num in 1..=limit {
         match doc.extract_text_with_limit(&[num as u32], 8 * 1024 * 1024) {
-            Ok(t) => pages.push(t),
+            // 重排：把绘制指令切出的碎片拼回自然段（否则正文每个碎片单独成段）
+            Ok(t) => pages.push(pdf_reflow_page(&t)),
             Err(e) => {
                 tracing::warn!("PDF 第 {num} 页文本提取失败：{e}");
                 pages.push(String::new());
@@ -1602,14 +1647,101 @@ fn pdf_first_page_image(doc: &lopdf::Document) -> Option<Vec<u8>> {
                 .collect(),
             _ => vec![],
         };
-        let is_image_file = filters
-            .iter()
-            .any(|f| f.as_slice() == b"DCTDecode" || f.as_slice() == b"JPXDecode");
-        if is_image_file && !stream.content.is_empty() {
-            return Some(stream.content.clone());
+        // 仅接受 **单一 DCTDecode**（JPEG）：
+        // - JPXDecode(JPEG2000) 虽也是完整图片文件，但下游一律按 .jpg 落盘并以
+        //   image/jpeg 提供，主流浏览器不支持 JP2 → 封面裂图，故不取；
+        // - 多滤镜链（如 [FlateDecode, DCTDecode]）的 stream.content 仍被前置滤镜压着，
+        //   直接返回是损坏的 JPEG，故要求 DCTDecode 为唯一滤镜。
+        let is_plain_jpeg = filters.len() == 1 && filters[0].as_slice() == b"DCTDecode";
+        if !is_plain_jpeg || stream.content.is_empty() {
+            continue;
         }
+        // CMYK JPEG（印刷版 PDF 常见，4 通道 + Adobe 反色）浏览器渲染会偏色 → 跳过
+        let is_cmyk = dict
+            .get(b"ColorSpace")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .map(|n| n == b"DeviceCMYK".as_slice())
+            .unwrap_or(false);
+        if is_cmyk {
+            continue;
+        }
+        return Some(stream.content.clone());
     }
     None
+}
+
+/// PDF 页文本重排（排版可读性）。
+///
+/// lopdf 的 `extract_text` 按 PDF 文本绘制指令（Tj/TJ）逐段输出，**每段一行**——
+/// 视觉上的一行会被切成多段，连标点都可能单独成行：
+/// ```text
+/// 不知不觉已经毕业快两年了 / ， / 这两年来 / ， / 我发现自己一直在作茧 / 自缚 / 。
+/// ```
+/// 直接交给阅读器会每个碎片渲染成一段（正文看起来支离破碎）。
+///
+/// 本函数把碎片重新拼成连续文本，并按句末标点切分自然段：
+/// - 拼接：CJK 之间不插空格；两侧都是 ASCII 字母/数字时补一个空格（保住英文词边界）；
+/// - 分段：句末标点（。！？…!?）后换段；行尾若是开引号/顿号等未完结标点则继续接。
+fn pdf_reflow_page(raw: &str) -> String {
+    /// 句末标点：其后开新段
+    fn is_sentence_end(c: char) -> bool {
+        matches!(c, '。' | '！' | '？' | '…' | '!' | '?')
+    }
+    /// 闭合类标点：跟在句末标点后仍属同一段（如 。」 。”）
+    fn is_closing(c: char) -> bool {
+        matches!(c, '”' | '』' | '」' | '）' | ')' | '》' | '】' | '"' | '\'')
+    }
+    let mut paras: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    // 句末标点后不立即收段：闭合引号（。” 。」）常作为**下一个**碎片到达，
+    // 立刻收段会把它孤立到下一段开头。改为挂起，待看到下一碎片再决定。
+    let mut pending_break = false;
+    for frag in raw.lines() {
+        let f = frag.trim();
+        if f.is_empty() {
+            // 空行：原文的显式分隔 → 结束当前段
+            if !cur.trim().is_empty() {
+                paras.push(cur.trim().to_string());
+                cur = String::new();
+            }
+            pending_break = false;
+            continue;
+        }
+        let starts_closing = f.chars().next().map(is_closing).unwrap_or(false);
+        if pending_break {
+            if starts_closing {
+                // 闭合引号并入上一段，随后仍需收段
+                cur.push_str(f);
+                paras.push(cur.trim().to_string());
+                cur = String::new();
+                pending_break = false;
+                continue;
+            }
+            // 普通碎片 → 上一段到此为止
+            paras.push(cur.trim().to_string());
+            cur = String::new();
+            pending_break = false;
+        }
+        // 拼接：仅在两侧都是 ASCII 字母数字时补空格（CJK 间不补）
+        if let (Some(prev), Some(next)) = (cur.chars().last(), f.chars().next()) {
+            if prev.is_ascii_alphanumeric() && next.is_ascii_alphanumeric() {
+                cur.push(' ');
+            }
+        }
+        cur.push_str(f);
+        // 以句末标点（或 句末标点+闭合引号）结尾 → 挂起收段
+        let tail: Vec<char> = cur.chars().rev().take(2).collect();
+        pending_break = match tail.first() {
+            Some(&c) if is_sentence_end(c) => true,
+            Some(&c) if is_closing(c) => tail.get(1).map(|&p| is_sentence_end(p)).unwrap_or(false),
+            _ => false,
+        };
+    }
+    if !cur.trim().is_empty() {
+        paras.push(cur.trim().to_string());
+    }
+    paras.join("\n")
 }
 
 /// PDF 元数据字符串解码（PDFDocEncoding/UTF-16BE/UTF-8；lopdf 0.44 Dictionary::get 返回 Result）
@@ -1620,10 +1752,33 @@ fn pdf_meta_string(v: Result<&lopdf::Object, lopdf::Error>) -> String {
         .unwrap_or_default()
 }
 
+/// 拼接 PDF 各页文本：上一页**未以句末标点收尾**时视为句子跨页续写，直接接上不留空行；
+/// 否则以空行分段。避免「…而且 / (空行) / 还偶尓上来看帖」这类跨页断句。
+fn join_pdf_pages(pages: &[String]) -> String {
+    let mut out = String::new();
+    for page in pages {
+        let p = page.trim();
+        if p.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            let continues = out
+                .trim_end()
+                .chars()
+                .last()
+                .map(|c| !matches!(c, '。' | '！' | '？' | '…' | '!' | '?' | '”' | '』' | '」'))
+                .unwrap_or(false);
+            out.push_str(if continues { "" } else { "\n\n" });
+        }
+        out.push_str(p);
+    }
+    out
+}
+
 /// PDF 分章：优先按章节标题规则（跨页全文匹配）；无标题 → 按页分章（每页一章）
 fn chapters_from_pages(pages: Vec<String>) -> Vec<Chapter> {
     let rules: Vec<String> = PDF_TOC_RULES.iter().map(|s| s.to_string()).collect();
-    let joined = pages.join("\n\n");
+    let joined = join_pdf_pages(&pages);
     let by_rules = split_by_rules(&joined, &rules);
     if !by_rules.is_empty() {
         return by_rules;
@@ -4617,5 +4772,109 @@ mod tests {
         assert_eq!(pts.len(), 1);
         assert_eq!(pts[0].1, "章");
         assert_eq!(pts[0].0, "OEBPS/a.xhtml");
+    }
+
+    /// 验收回归 High-2：章节标题含裸 `&` 时不得清空整个目录
+    #[test]
+    fn test_ncx_bare_ampersand_tolerant() {
+        let ncx = r#"<ncx><navMap>
+            <navPoint><navLabel><text>Q&A 章</text></navLabel>
+              <content src="a.xhtml"/></navPoint>
+            <navPoint><navLabel><text>第二章</text></navLabel>
+              <content src="b.xhtml"/></navPoint>
+          </navMap></ncx>"#;
+        let pts = ncx_nav_points(ncx, "OEBPS/toc.ncx");
+        assert_eq!(pts.len(), 2, "裸 & 不应清空目录: {pts:?}");
+        assert_eq!(pts[1].1, "第二章");
+    }
+
+    /// 验收回归 High-3：合规实体（&amp; / &#233;）不得被静默丢字符
+    #[test]
+    fn test_ncx_entity_decoding() {
+        let ncx = r#"<ncx><navMap>
+            <navPoint><navLabel><text>Tom &amp; Jerry</text></navLabel>
+              <content src="a.xhtml"/></navPoint>
+            <navPoint><navLabel><text>caf&#233; &#x4E2D;</text></navLabel>
+              <content src="b.xhtml"/></navPoint>
+          </navMap></ncx>"#;
+        let pts = ncx_nav_points(ncx, "OEBPS/toc.ncx");
+        assert_eq!(pts.len(), 2);
+        assert_eq!(pts[0].1, "Tom & Jerry", "&amp; 应解码为 &,不得丢字符");
+        assert_eq!(pts[1].1, "café 中", "数字实体应还原");
+    }
+
+    /// 真实文件回归（藏海花.epub 形态）：Calibre 产物每个 XHTML 的 <title> 都是书名，
+    /// spine 标题非空但零信息 → 默认 spin+toc 模式下应让 toc 真实章名覆盖，
+    /// 否则整本书所有章节都叫书名。
+    #[test]
+    fn test_merge_spine_title_equal_book_title_is_placeholder() {
+        let toc = vec![
+            ("c1.html".to_string(), "第一章 起源".to_string()),
+            ("c2.html".to_string(), "第二章 怪事".to_string()),
+        ];
+        let spine = vec![
+            (
+                "c1.html".to_string(),
+                Chapter { title: "藏海花".into(), content: "正文一".into() },
+            ),
+            (
+                "c2.html".to_string(),
+                Chapter { title: "自定义章名".into(), content: "正文二".into() },
+            ),
+        ];
+        // 用空 zip（本模式分支不读 zip）
+        let buf: Vec<u8> = {
+            let mut c = std::io::Cursor::new(Vec::new());
+            zip::ZipWriter::new(&mut c).finish().unwrap();
+            c.into_inner()
+        };
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(buf)).unwrap();
+        let out = merge_epub_chapters(&mut zip, &toc, spine, "spin+toc", "藏海花");
+        assert_eq!(out[0].title, "第一章 起源", "与书名雷同的占位标题应被 toc 覆盖");
+        assert_eq!(out[1].title, "自定义章名", "真实的 spine 标题不应被覆盖");
+    }
+
+    /// PDF 排版重排：绘制指令切出的碎片（含单独成行的标点）应拼回自然段
+    #[test]
+    fn test_pdf_reflow_page_merges_fragments() {
+        // 真实形态：正文被切成碎片，标点单独成行
+        let raw = "不知不觉已经毕业快两年了\n，\n这两年来\n，\n我发现自己一直在作茧\n自缚\n。\n我换了三次手机号码\n，\n尽力保持疏远\n。";
+        let out = pdf_reflow_page(raw);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "应合成 2 个自然段: {lines:?}");
+        assert_eq!(lines[0], "不知不觉已经毕业快两年了，这两年来，我发现自己一直在作茧自缚。");
+        assert_eq!(lines[1], "我换了三次手机号码，尽力保持疏远。");
+    }
+
+    /// 英文词边界：两侧都是 ASCII 字母数字时补空格，CJK 之间不补
+    #[test]
+    fn test_pdf_reflow_ascii_word_boundary() {
+        let out = pdf_reflow_page("hello\nworld\n。");
+        assert_eq!(out, "hello world。");
+        let out2 = pdf_reflow_page("中文\n继续\n。");
+        assert_eq!(out2, "中文继续。", "CJK 之间不应插空格");
+    }
+
+    /// 句末带闭合引号（。”）也应收段
+    #[test]
+    fn test_pdf_reflow_closing_quote() {
+        let out = pdf_reflow_page("他说\n：\n“走吧\n。\n”\n然后离开了\n。");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].ends_with('”'), "句末闭合引号应留在同段: {:?}", lines[0]);
+    }
+
+    /// 跨页续写：上页未以句末标点收尾 → 下页直接接上，不产生断句空行
+    #[test]
+    fn test_join_pdf_pages_continues_sentence() {
+        let pages = vec![
+            "天涯论坛我大一时就熟知了，而且".to_string(),
+            "还偶尔上来看帖。".to_string(),
+        ];
+        let joined = join_pdf_pages(&pages);
+        assert_eq!(joined, "天涯论坛我大一时就熟知了，而且还偶尔上来看帖。", "跨页句子应续写");
+        // 上页正常收尾 → 空行分段
+        let pages2 = vec!["第一段。".to_string(), "第二段。".to_string()];
+        assert_eq!(join_pdf_pages(&pages2), "第一段。\n\n第二段。");
     }
 }

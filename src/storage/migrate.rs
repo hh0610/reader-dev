@@ -337,8 +337,13 @@ async fn migrate_admin_default_personal_data_back(pool: &SqlitePool) -> Result<u
 /// - 同一 book_url 被多个用户收藏（共享书）或本就属于 default → 保持不动。
 /// 幂等：回填后 default 桶不再有对应行，重复执行影响 0 行。
 async fn backfill_chapter_namespace(pool: &SqlitePool) -> Result<usize> {
+    // OR IGNORE：user_namespace 是主键的一部分（PK = book_url, chapter_index, user_namespace）。
+    // 若同一 (book_url, chapter_index) 已同时存在 default 行与目标 ns 行，普通 UPDATE 会因
+    // UNIQUE 冲突**整条语句回滚**——一本冲突书就会让所有干净书的回填全部失败，且错误经 `?`
+    // 传播会使 migrate_if_needed 提前返回、跳过其后所有迁移步骤。OR IGNORE 跳过冲突行、
+    // 照常回填其余（冲突行的 default 残留无害：目标 ns 行已存在且优先命中）。
     let n = sqlx::query(
-        "UPDATE book_chapters SET user_namespace = (
+        "UPDATE OR IGNORE book_chapters SET user_namespace = (
              SELECT b.user_namespace FROM books b
              WHERE b.book_url = book_chapters.book_url AND b.user_namespace <> 'default'
          )
@@ -2182,6 +2187,46 @@ mod tests {
 
         // 幂等：再跑一次影响 0 行
         assert_eq!(backfill_chapter_namespace(pool).await.unwrap(), 0, "回填应幂等");
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 验收回归:回填遇主键冲突(default 行与目标 ns 行共存)时,须跳过冲突行、
+    /// 照常回填其余干净书——普通 UPDATE 会整条回滚致所有回填失败并中断迁移链。
+    #[tokio::test]
+    async fn test_backfill_chapter_namespace_conflict_tolerant() {
+        let dir = test_dir("backfill-conflict");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = AppConfig::from_env();
+        config.work_dir = dir.to_string_lossy().into_owned();
+        let storage = init(&config).await.unwrap();
+        let pool = &storage.pool;
+
+        // 冲突书 X:default 行与 alice 行同 (book_url, chapter_index) 共存
+        sqlx::query("INSERT INTO books (book_url, name, user_namespace) VALUES ('local://x', 'X', 'alice')")
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO book_chapters (book_url, chapter_index, title, content, user_namespace) VALUES ('local://x', 0, '旧', '旧正文', 'default')")
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO book_chapters (book_url, chapter_index, title, content, user_namespace) VALUES ('local://x', 0, '新', '新正文', 'alice')")
+            .execute(pool).await.unwrap();
+        // 干净书 Y:仅 default 行,唯一归属 bob
+        sqlx::query("INSERT INTO books (book_url, name, user_namespace) VALUES ('local://y', 'Y', 'bob')")
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO book_chapters (book_url, chapter_index, title, content, user_namespace) VALUES ('local://y', 0, '章', '正文', 'default')")
+            .execute(pool).await.unwrap();
+
+        // 不得报错(否则 migrate_if_needed 会中断整条迁移链)
+        let n = backfill_chapter_namespace(pool).await.expect("冲突不应使迁移报错");
+        assert_eq!(n, 1, "干净书 Y 应被回填(冲突书 X 跳过)");
+
+        let y_ns: String = sqlx::query_scalar("SELECT user_namespace FROM book_chapters WHERE book_url = 'local://y'")
+            .fetch_one(pool).await.unwrap();
+        assert_eq!(y_ns, "bob", "冲突书不应拖垮干净书的回填");
+        // 冲突书:alice 行保留(优先命中),default 行作无害残留
+        let x_alice: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM book_chapters WHERE book_url='local://x' AND user_namespace='alice'")
+            .fetch_one(pool).await.unwrap();
+        assert_eq!(x_alice, 1);
 
         pool.close().await;
         let _ = std::fs::remove_dir_all(&dir);

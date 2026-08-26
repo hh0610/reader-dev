@@ -38,6 +38,8 @@ pub fn parse_opf(xml: &str) -> OpfMeta {
     let mut meta = OpfMeta::default();
     // manifest：id → href（EPUB2 `<meta name="cover" content="ID">` 间接封面用）
     let mut manifest: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // manifest 中 media-type 为 image/* 的 href 集合（封面候选须是真图片，非 HTML 包装页）
+    let mut image_hrefs: std::collections::HashSet<String> = std::collections::HashSet::new();
     // 封面候选（优先级：guide reference > properties=cover-image > meta name=cover > id=cover）
     let mut cover_guide: Option<String> = None;
     let mut cover_properties: Option<String> = None;
@@ -46,6 +48,13 @@ pub fn parse_opf(xml: &str) -> OpfMeta {
 
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(false);
+    // 容错配置（关键）：真实 EPUB 的 OPF 常不严格合规——书名含裸 `&`（`Tom & Jerry`、
+    // `Simon & Schuster`）、dc:description 里塞裸 HTML（`<br>` 不闭合）。quick-xml 默认
+    // `check_end_names=true` / `allow_dangling_amp=false` 会在首处不合规即报错，配合
+    // `Err(_) => break` 将丢弃其后**全部**字段（比旧的字符串扫描器更不容错 = 回归）。
+    // 放宽这两项后，畸形处按原文保留、后续字段照常解析。
+    reader.config_mut().check_end_names = false;
+    reader.config_mut().allow_dangling_amp = true;
     let mut buf = Vec::new();
     // 当前正在收集文本的 dc 字段（local-name）
     let mut cur_field: Option<String> = None;
@@ -66,8 +75,15 @@ pub fn parse_opf(xml: &str) -> OpfMeta {
                         let id = attr_of(&e, "id").unwrap_or_default();
                         let href = attr_of(&e, "href").unwrap_or_default();
                         let props = attr_of(&e, "properties").unwrap_or_default();
+                        let media = attr_of(&e, "media-type").unwrap_or_default();
                         if !id.is_empty() && !href.is_empty() {
                             manifest.insert(id.clone(), href.clone());
+                        }
+                        // 记录哪些 href 是图片（media-type=image/*）——封面回退链据此
+                        // 跳过指向 HTML 包装页的候选（Calibre EPUB2 的 guide 常指向
+                        // titlepage.xhtml，此前会把 HTML 当图片字节读出 → 裂图）
+                        if !href.is_empty() && media.starts_with("image/") {
+                            image_hrefs.insert(href.clone());
                         }
                         // EPUB3：properties 含 cover-image（空白分隔多值）
                         if !href.is_empty()
@@ -204,11 +220,24 @@ pub fn parse_opf(xml: &str) -> OpfMeta {
         buf.clear();
     }
 
-    // 封面回退链：guide > EPUB3 properties > EPUB2 meta name=cover（经 manifest 查 href）> id=cover
-    meta.cover_href = cover_guide
-        .or(cover_properties)
-        .or_else(|| cover_meta_id.and_then(|id| manifest.get(&id).cloned()))
-        .or(cover_id_item);
+    // 封面回退链：guide > EPUB3 properties > EPUB2 meta name=cover（经 manifest 查 href）> id=cover。
+    // 两轮选取：**先只认 manifest 里 media-type=image/* 的候选**，全不命中再放宽。
+    // 否则 Calibre EPUB2 的 guide（常指向 titlepage.xhtml 包装页）会赢过 meta name=cover
+    // 指向的真图 → 读出 HTML 当封面字节 → 裂图（新增的 meta 封面特性也就形同虚设）。
+    let meta_cover_href = cover_meta_id.and_then(|id| manifest.get(&id).cloned());
+    let candidates = [
+        cover_guide,
+        cover_properties,
+        meta_cover_href,
+        cover_id_item,
+    ];
+    // 无 manifest media-type 信息时（image_hrefs 为空）不做过滤，保持原回退顺序
+    meta.cover_href = candidates
+        .iter()
+        .flatten()
+        .find(|h| image_hrefs.contains(*h))
+        .cloned()
+        .or_else(|| candidates.iter().flatten().next().cloned());
 
     meta
 }
@@ -424,5 +453,61 @@ mod tests {
             <item media-type='image/png' href='cov.png' properties='cover-image' id='x'/>
           </manifest></package>"#;
         assert_eq!(parse_opf(xml).cover_href.as_deref(), Some("cov.png"));
+    }
+
+    /// 验收回归：书名/字段含**裸 `&`**（Tom & Jerry / Simon & Schuster）时，
+    /// 不得中断解析丢掉后续字段（quick-xml 默认 allow_dangling_amp=false 会 break）
+    #[test]
+    fn test_parse_opf_bare_ampersand_tolerant() {
+        let xml = r#"<package><metadata>
+            <dc:title>Tom & Jerry</dc:title>
+            <dc:creator>作者X</dc:creator>
+            <dc:publisher>Simon & Schuster</dc:publisher>
+          </metadata></package>"#;
+        let m = parse_opf(xml);
+        assert!(m.title.contains("Tom"), "书名不应丢失: {:?}", m.title);
+        assert_eq!(m.author, "作者X", "裸 & 之后的字段不应丢失");
+        assert!(m.publisher.is_some(), "publisher 不应丢失");
+    }
+
+    /// 验收回归：dc:description 内塞裸 HTML（<br> 不闭合）时，其后字段不得全丢
+    #[test]
+    fn test_parse_opf_unbalanced_inline_tag_tolerant() {
+        let xml = r#"<package><metadata>
+            <dc:description>第一行<br>第二行</dc:description>
+            <dc:creator>作者Y</dc:creator>
+            <dc:publisher>某社</dc:publisher>
+          </metadata></package>"#;
+        let m = parse_opf(xml);
+        assert_eq!(m.author, "作者Y", "不闭合内联标签之后的字段不应丢失");
+        assert_eq!(m.publisher.as_deref(), Some("某社"));
+    }
+
+    /// 验收回归：guide 指向 HTML 包装页时，应优先选 manifest 里 media-type=image/* 的真图
+    /// （Calibre EPUB2 典型布局：guide→titlepage.xhtml，meta name=cover→真图）
+    #[test]
+    fn test_parse_opf_cover_prefers_real_image_over_html_wrapper() {
+        let xml = r#"<package><metadata>
+            <meta name="cover" content="cover-img"/>
+          </metadata>
+          <manifest>
+            <item id="titlepage" href="titlepage.xhtml" media-type="application/xhtml+xml"/>
+            <item id="cover-img" href="images/cover.jpg" media-type="image/jpeg"/>
+          </manifest>
+          <guide><reference type="cover" href="titlepage.xhtml"/></guide></package>"#;
+        let m = parse_opf(xml);
+        assert_eq!(
+            m.cover_href.as_deref(),
+            Some("images/cover.jpg"),
+            "应跳过 HTML 包装页,选 media-type=image/* 的真图"
+        );
+    }
+
+    /// 无 media-type 信息时保持原回退顺序（guide 优先），不因过滤而丢封面
+    #[test]
+    fn test_parse_opf_cover_fallback_without_media_type() {
+        let xml = r#"<package><guide>
+            <reference type="cover" href="cover.jpg"/></guide></package>"#;
+        assert_eq!(parse_opf(xml).cover_href.as_deref(), Some("cover.jpg"));
     }
 }

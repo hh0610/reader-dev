@@ -11173,11 +11173,30 @@ async fn serve_data_file(
     if matches!(ext.as_str(), "html" | "htm" | "xhtml") {
         let html = String::from_utf8_lossy(&bytes);
         let injected = inject_api_root_script(&html, &request_base_url(headers));
-        return Response::builder()
+        let mut builder = Response::builder()
             .status(StatusCode::OK)
-            .header("Content-Type", "text/html; charset=utf-8")
-            .body(Body::from(injected))
-            .unwrap();
+            .header("Content-Type", "text/html; charset=utf-8");
+        // secure 模式：随章节 HTML 下发路径限定的鉴权 cookie，供该页内相对
+        // <img>/<link> 子请求携带（浏览器不会给子请求加 query token）。
+        // HttpOnly + SameSite=Strict + Path 限定到本命名空间前缀；仅 GET 静态读，
+        // 且 token 本就随 query 传递（OPDS 同样如此），CSRF 面可忽略。
+        if state.storage.config.secure {
+            if let Some(tok) = params.get("accessToken").filter(|t| !t.is_empty()) {
+                let ns_seg = rel
+                    .components()
+                    .next()
+                    .and_then(|c| c.as_os_str().to_str())
+                    .unwrap_or("");
+                let path = format!("{prefix}{ns_seg}/");
+                builder = builder.header(
+                    axum::http::header::SET_COOKIE,
+                    format!(
+                        "{ASSET_TOKEN_COOKIE}={tok}; Path={path}; HttpOnly; SameSite=Strict; Max-Age=3600"
+                    ),
+                );
+            }
+        }
+        return builder.body(Body::from(injected)).unwrap();
     }
     Response::builder()
         .status(StatusCode::OK)
@@ -11186,8 +11205,31 @@ async fn serve_data_file(
         .unwrap()
 }
 
+/// 静态资源鉴权 cookie 名（见 [`data_file_namespace_ok`]）
+const ASSET_TOKEN_COOKIE: &str = "reader_asset_token";
+
+/// 从 Cookie 头取指定 cookie 值
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())?;
+    for part in raw.split(';') {
+        let part = part.trim();
+        if let Some(v) = part.strip_prefix(name).and_then(|r| r.strip_prefix('=')) {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// secure 模式下 storage/data 资源的命名空间校验：rel 首段（namespace）必须等于 token
 /// 对应用户；管理员放行；非 secure 模式放行（单用户无跨租户边界）。
+///
+/// token 来源：query/header（首次访问）**或 `reader_asset_token` cookie**。
+/// cookie 回退是必需的——EPUB 章节 HTML 内的相对 `<img>`/`<link>` 由浏览器发起子请求，
+/// 不会携带 query/header token；仅认 query 会让 secure 模式下的图片/样式全部 404。
 async fn data_file_namespace_ok(
     state: &AppState,
     params: &HashMap<String, String>,
@@ -11197,9 +11239,20 @@ async fn data_file_namespace_ok(
     if !state.storage.config.secure {
         return true;
     }
+    // 先按 query/header 解析；失败再回退 cookie 携带的 token
     let user = match resolve_current_user(state, params, headers).await {
         Ok(u) => u,
-        Err(_) => return false,
+        Err(_) => {
+            let Some(tok) = cookie_value(headers, ASSET_TOKEN_COOKIE) else {
+                return false;
+            };
+            let mut p = HashMap::new();
+            p.insert("accessToken".to_string(), tok);
+            match resolve_current_user(state, &p, &HeaderMap::new()).await {
+                Ok(u) => u,
+                Err(_) => return false,
+            }
+        }
     };
     if user.is_admin {
         return true;
@@ -22669,6 +22722,77 @@ mod tests {
         }
         assert!(store.get(ns, "u1").is_none(), "最早条目应被淘汰");
         assert!(store.get(ns, "fill-209").is_some(), "最新条目应保留");
+    }
+
+    /// 验收回归：secure 模式静态资源鉴权 —— 无 token 拒绝、带 token 放行并下发
+    /// 路径限定 cookie、后续子请求仅凭 cookie 可读、跨租户仍拒绝。
+    #[tokio::test]
+    async fn test_epub_assets_secure_auth_and_cookie_fallback() {
+        use tower::ServiceExt as _;
+        let (mut state, dir) = test_state("epubsecure").await;
+        // 造两个用户 + alice 的章节 HTML 与图片
+        for (u, tok) in [("alice", "tok-a"), ("bob", "tok-b")] {
+            let user = crate::model::User {
+                username: u.to_string(),
+                token: tok.to_string(),
+                last_login_at: now_millis(),
+                ..Default::default()
+            };
+            state.storage.insert_user(&user).await.unwrap();
+        }
+        let data = state.storage.config.storage_dir().join("data");
+        let chap = data.join("alice/书_作者/index");
+        std::fs::create_dir_all(&chap).unwrap();
+        std::fs::write(chap.join("c1.html"), "<html><body>正文</body></html>").unwrap();
+        let imgd = data.join("alice/book-assets");
+        std::fs::create_dir_all(&imgd).unwrap();
+        std::fs::write(imgd.join("p.png"), [0x89u8, b'P', b'N', b'G']).unwrap();
+
+        state.storage.config.secure = true;
+        let app = axum::Router::new()
+            .route("/book-assets/*rest", get(book_assets))
+            .route("/epub/*rest", get(epub_asset))
+            .with_state(state.clone());
+        let get_uri = |uri: &str, cookie: Option<&str>| {
+            let mut b = axum::http::Request::builder().uri(uri).header("host", "s:8080");
+            if let Some(c) = cookie {
+                b = b.header("cookie", c);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+
+        // ① 无 token → 404（此前匿名可读，是被修的漏洞）
+        let r = app.clone().oneshot(get_uri("/epub/alice/书_作者/index/c1.html", None)).await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "secure 模式无 token 应拒绝");
+
+        // ② 带 token → 200 且下发路径限定 cookie
+        let r = app.clone()
+            .oneshot(get_uri("/epub/alice/书_作者/index/c1.html?accessToken=alice:tok-a", None))
+            .await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "本人带 token 应放行");
+        let sc = r.headers().get("set-cookie").map(|v| v.to_str().unwrap().to_string())
+            .expect("应下发鉴权 cookie 供子请求使用");
+        assert!(sc.contains("reader_asset_token=alice:tok-a"), "cookie: {sc}");
+        assert!(sc.contains("Path=/epub/alice/") && sc.contains("HttpOnly"), "cookie 应路径限定+HttpOnly: {sc}");
+
+        // ③ 子请求（图片）仅凭 cookie 可读——浏览器不会给子请求加 query token
+        let r = app.clone()
+            .oneshot(get_uri("/book-assets/alice/book-assets/p.png", Some("reader_asset_token=alice:tok-a")))
+            .await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "cookie 回退应让子资源可读");
+
+        // ④ 跨租户：bob 的 token 读 alice 的资源 → 404
+        let r = app.clone()
+            .oneshot(get_uri("/epub/alice/书_作者/index/c1.html?accessToken=bob:tok-b", None))
+            .await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "跨租户读应拒绝");
+        // ⑤ 跨租户 cookie 同样拒绝
+        let r = app.clone()
+            .oneshot(get_uri("/book-assets/alice/book-assets/p.png", Some("reader_asset_token=bob:tok-b")))
+            .await.unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND, "跨租户 cookie 应拒绝");
+
+        cleanup(state, dir).await;
     }
 
     /// legacy 静态路由 /book-assets/* + /epub/*（YueduApi.kt:136-162）：

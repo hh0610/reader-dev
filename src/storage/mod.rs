@@ -4021,11 +4021,20 @@ impl Storage {
         // 计算后写，后写覆盖前写致某设备 token 未入 map（随后被判未登录）。
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        // SELECT 失败也须 ROLLBACK——否则带着未提交的 IMMEDIATE 写事务（持 WAL 写锁）
+        // 归还连接池（sqlx 不跟踪裸 BEGIN，不会自动回滚），阻塞后续写路径。
         let cur: Option<Option<String>> =
-            sqlx::query_scalar("SELECT token_map FROM users WHERE username = ?1")
+            match sqlx::query_scalar("SELECT token_map FROM users WHERE username = ?1")
                 .bind(username)
                 .fetch_optional(&mut *conn)
-                .await?;
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(e.into());
+                }
+            };
         let cur_map = cur
             .flatten()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
@@ -4058,11 +4067,19 @@ impl Storage {
         // L9：同 add_user_token，BEGIN IMMEDIATE 序列化读改写
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        // SELECT 失败也须 ROLLBACK（同 add_user_token，防写事务泄漏）
         let row: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT token, token_map FROM users WHERE username = ?1")
+            match sqlx::query_as("SELECT token, token_map FROM users WHERE username = ?1")
                 .bind(username)
                 .fetch_optional(&mut *conn)
-                .await?;
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(e.into());
+                }
+            };
         let Some((main, token_map_str)) = row else {
             let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
             return Ok(0);
