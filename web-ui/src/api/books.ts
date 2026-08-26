@@ -25,7 +25,7 @@ export function searchBookSource(
 export function getBookToc(
   tocUrl: string,
   bookSource: string,
-  opts?: { timeout?: number },
+  opts?: { timeout?: number; silent?: boolean },
 ): Promise<ReturnData<BookChapter[]>> {
   return get<BookChapter[]>('/getBookToc', { tocUrl, bookSource }, opts)
 }
@@ -69,7 +69,7 @@ export function searchBookSourceSSE(
 export function getBookContent(
   chapterUrl: string,
   bookSource: string,
-  opts?: { timeout?: number },
+  opts?: { timeout?: number; silent?: boolean },
   epubContent?: number,
 ): Promise<ReturnData<BookContent>> {
   return get<BookContent>(

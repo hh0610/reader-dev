@@ -232,7 +232,10 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
             get(get_replace_rules).post(get_replace_rules),
         )
         .route("/reader3/saveReplaceRule", post(save_replace_rule))
-        .route("/reader3/saveReplaceRules", post(save_replace_rules))
+        .route(
+            "/reader3/saveReplaceRules",
+            post(save_replace_rules).layer(axum::extract::DefaultBodyLimit::max(upload_limit)),
+        )
         .route(
             "/reader3/replaceRule/saveMulti",
             post(save_replace_rule_multi),
@@ -283,7 +286,12 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
             get(get_book_source).post(get_book_source),
         )
         .route("/reader3/saveBookSource", post(save_book_source))
-        .route("/reader3/saveBookSources", post(save_book_sources))
+        .route(
+            // 书源订阅动辄数 MB（axum 默认 body 上限仅 2MB，超限时 body 提取失败 →
+            // 曾表现为「参数错误」而非明确提示）——复用上传上限（READER_UPLOAD_MAX_MB）
+            "/reader3/saveBookSources",
+            post(save_book_sources).layer(axum::extract::DefaultBodyLimit::max(upload_limit)),
+        )
         .route("/reader3/deleteBookSource", post(delete_book_source))
         .route("/reader3/deleteBookSources", post(delete_book_sources))
         .route(

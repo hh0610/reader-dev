@@ -3177,8 +3177,10 @@ async function loadSourcePreview(r: SearchBook, key: string) {
   const b = shelfBook.value
   if (!b) return
   try {
+    // silent：同下方正文预览——候选源目录失效不应弹全局 toast
     const tocRes = await getBookToc(r.tocUrl || b.tocUrl, r.origin, {
       timeout: chapterTimeout.value * 1000,
+      silent: true,
     })
     const toc = tocRes.isSuccess ? (tocRes.data ?? []) : []
     const oldIdx = currentChapter.value ? chapterIndex.value : -1
@@ -3188,8 +3190,11 @@ async function loadSourcePreview(r: SearchBook, key: string) {
     let currentLast = ''
     if (idx >= 0 && toc[idx] && !toc[idx].isVolume && isTextBook.value) {
       const ch = toc[idx]
+      // silent：换源预览是后台探测，失败在卡片内以「当前章末尾预览获取失败」呈现，
+      // 不弹全局错误 toast（候选源常有失效/类型不符者，逐个弹会刷屏）
       const contentRes = await getBookContent(ch.url, r.origin, {
         timeout: chapterTimeout.value * 1000,
+        silent: true,
       })
       const text = contentRes.data?.content ?? ''
       const paras = text
