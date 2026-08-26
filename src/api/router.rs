@@ -2763,6 +2763,15 @@ async fn search_book_source(
             return Json(ReturnData::ok(serde_json::Value::Null));
         }
     }
+    // 书源类型过滤（bookSourceType：0 文本/1 音频/2 漫画/3 文件/4 视频）——
+    // 换源时只探测同类型源：拿漫画源去搜文字书必然取不到正文，白白消耗请求与时间。
+    // 缺省不传 = 不过滤（保持既有行为）。
+    if let Some(want_type) = parse_book_source_type(&params, body_json.as_ref()) {
+        sources.retain(|s| s.book_source_type == want_type);
+        if sources.is_empty() {
+            return Json(ReturnData::ok(serde_json::Value::Null));
+        }
+    }
     let paginated = last_index_param.is_some();
     if paginated {
         let li = last_index_param.unwrap();
@@ -2872,6 +2881,20 @@ pub(crate) fn param_of(
         }
     }
     params.get(key).cloned().unwrap_or_default()
+}
+
+/// 解析换源的书源类型过滤参数 `bookSourceType`（0 文本/1 音频/2 漫画/3 文件/4 视频）。
+/// 缺省/空/非法 → None（不过滤）。
+fn parse_book_source_type(
+    params: &HashMap<String, String>,
+    body: Option<&serde_json::Value>,
+) -> Option<i64> {
+    let raw = param_of(params, body, "bookSourceType");
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    raw.parse::<i64>().ok().filter(|t| (0..=4).contains(t))
 }
 
 /// 书源分组匹配：group 为空匹配全部；书源分组支持逗号/顿号/空白分隔
@@ -5880,6 +5903,9 @@ async fn search_book_source_sse(
     }
 
     // ② 全部启用可搜索书源（排除当前源）
+    // bookSourceType 过滤（0 文本/1 音频/2 漫画/3 文件/4 视频）：只探测同类型源——
+    // 拿漫画源搜文字书必然无正文，白耗请求与时间。缺省不传 = 不过滤。
+    let type_filter = parse_book_source_type(&params, body_json.as_ref());
     let current = book_source_param.trim();
     let sources: Vec<crate::model::BookSource> =
         match state.storage.get_book_sources(&namespace).await {
@@ -5890,6 +5916,7 @@ async fn search_book_source_sse(
                         && s.search_url.is_some()
                         && s.book_source_url != current
                         && s.book_source_name != current
+                        && type_filter.map(|t| s.book_source_type == t).unwrap_or(true)
                 })
                 .collect(),
             Err(_) => return sse_error(ReturnData::err("系统错误")),

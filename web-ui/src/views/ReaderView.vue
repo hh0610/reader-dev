@@ -226,6 +226,13 @@ function cycleEpubMode(): void {
   const order: EpubMode[] = ['text', 'html', 'raw']
   const i = order.indexOf(epubMode.value)
   epubMode.value = order[(i + 1) % order.length]!
+  // 必须按新模式重拉正文：html 模式要 epubContent=1 的 HTML，text 模式要纯文本。
+  // 此前只改状态不重拉 → text→html 时 chapterHtml 仍为空、界面毫无变化（按钮像失灵），
+  // html→text 时 content 为空 → 落到「本章无内容」空态。
+  content.value = ''
+  chapterHtml.value = ''
+  const ch = currentChapter.value
+  if (ch && epubMode.value !== 'raw') void loadContent(ch.url)
 }
 
 /* ---------------- 1. 主题（亮/暗/暖/跟随系统/自定义） ---------------- */
@@ -2425,8 +2432,10 @@ function preloadNextChapterImages() {
   const next = realChapters.value[fi + 1]
   if (preloadedChapters.has(next.url)) return
   preloadedChapters.add(next.url)
+  // silent：纯后台预取（下一章图片），失败不应打断阅读弹 toast
   void getBookContent(next.url, shelfBook.value.origin, {
     timeout: chapterTimeout.value * 1000,
+    silent: true,
   })
     .then((res) => {
       for (const u of extractImageUrls(res.data?.content ?? '').slice(0, 5)) {
@@ -2801,8 +2810,14 @@ async function applyRestoreScroll() {
 
 /* ---------------- 正文加载 ---------------- */
 
+/** 正文加载代际号：切章/换源会自增，过期响应一律丢弃。
+ *  此前无守卫——长按「下一章」会并发十几个请求，最后返回的（不一定是最后请求的）
+ *  覆盖 content，导致标题与正文对不上；早完成的请求还会提前把 loading 置 false 闪空态。 */
+let contentSeq = 0
+
 async function loadContent(chapterUrl: string) {
   if (!shelfBook.value?.origin) return
+  const seq = ++contentSeq
   loading.value = true
   loadError.value = false
   content.value = ''
@@ -2819,6 +2834,7 @@ async function loadContent(chapterUrl: string) {
         { timeout: chapterTimeout.value * 1000 },
         1,
       )
+      if (seq !== contentSeq) return // 过期响应：已切到别的章
       chapterHtml.value = res.data?.content ?? ''
     } else {
       // 本机缓存优先；未命中再走服务器缓存/书源（getBookContent 命中服务器缓存，未命中自动抓取并写回）
@@ -2844,6 +2860,7 @@ async function loadContent(chapterUrl: string) {
           })
         }
       }
+      if (seq !== contentSeq) return // 过期响应：已切到别的章
       content.value = text
     }
     // 章节字数：后端 chapterWordCount（本地书正文接口附带）优先；缺失用已缓存正文估算
@@ -2857,12 +2874,15 @@ async function loadContent(chapterUrl: string) {
       void startTts()
     }
   } catch {
+    if (seq !== contentSeq) return // 过期请求的失败不应影响当前章
     ttsAutoNext = false
     loadError.value = true
     return
   } finally {
-    loading.value = false
+    // 仅最新一代收尾，否则早完成的旧请求会提前结束加载态、闪出空态
+    if (seq === contentSeq) loading.value = false
   }
+  if (seq !== contentSeq) return
   // 等正文真正渲染（loading 置 false 后）再滚动，避免被加载态高度钳制
   await nextTick()
   if (isFlipMode()) measureFlipColumns()
@@ -2990,6 +3010,9 @@ const sourceBusy = ref(false)
 const sourceSwitching = ref(false)
 const sourceResults = ref<SearchBook[]>([])
 const sourceKeyword = ref('')
+/** 换源类型筛选：''=全部；0 文本/1 音频/2 漫画/3 文件/4 视频。
+ *  默认跟随当前书类型——只探测同类源，避免无谓请求（漫画源搜文字书必然无正文）。 */
+const sourceTypeFilter = ref<string>('')
 const sourceMsg = ref('')
 const sourceMsgError = ref(false)
 const sourceDoneCount = ref(0)
@@ -3016,17 +3039,35 @@ function canSwitchSource(): boolean {
 function openSource() {
   sourceOpen.value = true
   document.body.style.overflow = 'hidden'
+  // 默认只搜同类型书源（当前书 type：0 文本/1 音频/2 漫画/3 文件/4 视频）——
+  // 用户可在弹窗内改为「全部类型」
+  const t = shelfBook.value?.type
+  sourceTypeFilter.value = typeof t === 'number' && t >= 0 && t <= 4 ? String(t) : ''
   void runSourceSearch()
 }
 
+/** 切换类型筛选 → 重新搜索（省去无谓的跨类型探测） */
+function onSourceTypeChange() {
+  refreshSource()
+}
+
 function closeSource() {
-  if (sourceBusy.value || sourceSwitching.value) return
+  // 切换中（正在写库/跳转）才拦，搜索中允许随时关闭：
+  // forceCloseSource 会 abort SSE 并清空预览队列。此前搜索中一律拒关，
+  // 书源多时要等几分钟，流若静默卡死则弹窗永久锁死（body.overflow 也一直挂着）。
+  if (sourceSwitching.value) return
   forceCloseSource()
 }
 
 function forceCloseSource() {
   sourceSSEHandle?.abort()
   sourceSSEHandle = null
+  // 预览队列清零：每个任务 = getBookToc + getBookContent，
+  // 不清的话关窗后仍会把剩余候选源全部打一遍
+  previewQueue = []
+  previewRunning = 0
+  previewSeq += 1
+  sourceBusy.value = false
   sourceOpen.value = false
   document.body.style.overflow = ''
 }
@@ -3034,6 +3075,10 @@ function forceCloseSource() {
 function refreshSource() {
   if (sourceBusy.value) return
   sourceSSEHandle?.abort()
+  // 清空在途预览（否则上一轮的任务会继续写入并与新一轮交叉）
+  previewQueue = []
+  previewRunning = 0
+  previewSeq += 1
   sourceResults.value = []
   sourcePreviews.value = {}
   void runSourceSearch()
@@ -3093,6 +3138,9 @@ async function runSourceSearch() {
       invalidSourceUrls.value = new Set()
     }
     let sseFailed = false
+    // 类型过滤参数（''=全部）——SSE 与降级调用共用
+    const typeArg =
+      sourceTypeFilter.value === '' ? undefined : Number(sourceTypeFilter.value)
     try {
       const handle = await searchBookSourceSSE(b.bookUrl, b.origin, {
         onBooks: (_lastIndex, books) => {
@@ -3117,13 +3165,13 @@ async function runSourceSearch() {
             finalizeSourceResults()
           }
         },
-      })
+      }, typeArg)
       sourceSSEHandle = handle
     } catch {
       sseFailed = true
     }
     if (sseFailed) {
-      const res = await searchBookSource(b.bookUrl, b.origin, { silent: true })
+      const res = await searchBookSource(b.bookUrl, b.origin, { silent: true }, typeArg)
       appendSourceResults(res.data ?? [])
       finalizeSourceResults()
       sourceBusy.value = false
@@ -3142,9 +3190,15 @@ async function runSourceSearch() {
 const PREVIEW_CONCURRENCY = 4
 let previewQueue: Array<() => Promise<void>> = []
 let previewRunning = 0
+/** 预览代际号：关窗/重搜时自增，在途任务据此自行作废（不再写入已废弃的状态） */
+let previewSeq = 0
 
 function enqueuePreview(task: () => Promise<void>) {
-  previewQueue.push(task)
+  const seq = previewSeq
+  previewQueue.push(async () => {
+    if (seq !== previewSeq) return
+    await task()
+  })
   drainPreviewQueue()
 }
 
@@ -3177,11 +3231,16 @@ async function loadSourcePreview(r: SearchBook, key: string) {
   const b = shelfBook.value
   if (!b) return
   try {
-    // silent：同下方正文预览——候选源目录失效不应弹全局 toast
-    const tocRes = await getBookToc(r.tocUrl || b.tocUrl, r.origin, {
-      timeout: chapterTimeout.value * 1000,
-      silent: true,
-    })
+    // 候选源目录：必须用**候选源自己的** tocUrl/bookUrl。
+    // 此前回退到 b.tocUrl（当前源的目录地址）→ 拿旧源地址配新源规则必然失败；
+    // 两者皆空时 tocUrl='' → 后端报「请输入书籍链接」。
+    // silent：预览为后台探测，失败在卡片内提示，不弹全局 toast。
+    const tocRes = await getBookToc(
+      r.tocUrl || r.bookUrl,
+      r.origin,
+      { timeout: chapterTimeout.value * 1000, silent: true },
+      r.bookUrl,
+    )
     const toc = tocRes.isSuccess ? (tocRes.data ?? []) : []
     const oldIdx = currentChapter.value ? chapterIndex.value : -1
     const oldTitle = currentChapter.value?.title || b.durChapterTitle || ''
@@ -3237,9 +3296,14 @@ async function switchSource(r: SearchBook) {
     b.originName = r.originName
     b.tocUrl = r.tocUrl
     currentOrigin.value = r.origin
-    const tocRes = await getBookToc(r.tocUrl || b.tocUrl, r.origin, {
-      timeout: chapterTimeout.value * 1000,
-    })
+    // 同上：用候选源自己的 tocUrl/bookUrl（b.tocUrl 此刻已被赋为 r.tocUrl，
+    // 若候选源搜索结果无 tocUrl 则两者皆空 → 换源必失败）
+    const tocRes = await getBookToc(
+      r.tocUrl || r.bookUrl,
+      r.origin,
+      { timeout: chapterTimeout.value * 1000 },
+      r.bookUrl,
+    )
     if (!tocRes.isSuccess || !tocRes.data?.length) {
       ElMessage.error('新书源目录获取失败，请重试')
       return
@@ -5277,6 +5341,19 @@ onBeforeUnmount(() => {
               </div>
 
               <div v-if="!sourceBusy && sourceResults.length" class="source-tools">
+                <select
+                  v-model="sourceTypeFilter"
+                  class="source-type-filter"
+                  title="按书源类型筛选（只搜同类源可显著减少请求）"
+                  @change="onSourceTypeChange"
+                >
+                  <option value="">全部类型</option>
+                  <option value="0">小说</option>
+                  <option value="2">漫画</option>
+                  <option value="1">音频</option>
+                  <option value="4">视频</option>
+                  <option value="3">文件</option>
+                </select>
                 <input
                   v-model="sourceKeyword"
                   class="source-filter"
@@ -6750,6 +6827,23 @@ onBeforeUnmount(() => {
   transition: border-color 0.2s ease;
 }
 .source-filter:focus {
+  border-color: var(--accent, #4f46e5);
+}
+/* 换源类型筛选下拉（与搜索框同风格；只搜同类源可显著减少请求量） */
+.source-type-filter {
+  flex: 0 0 auto;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-weight: 300;
+  border: 1px solid var(--border, #ececec);
+  border-radius: 8px;
+  background: var(--card, #fff);
+  color: var(--text-1, #333);
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+}
+.source-type-filter:focus {
   border-color: var(--accent, #4f46e5);
 }
 .source-refresh {

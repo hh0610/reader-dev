@@ -56,11 +56,14 @@ export function decodeEntities(s: string): string {
  */
 export function isDangerousUrl(value: string): boolean {
   const stripped = value.replace(/[\u0000-\u0020\u007f]/g, '').toLowerCase()
-  return (
-    stripped.startsWith('javascript:') ||
-    stripped.startsWith('data:') ||
-    stripped.startsWith('vbscript:')
-  )
+  if (stripped.startsWith('javascript:') || stripped.startsWith('vbscript:')) return true
+  if (stripped.startsWith('data:')) {
+    // data: 默认危险，但**放行 base64 位图**：本地书（EPUB 内联图 / CBZ / 扫描版 PDF）
+    // 的正文图片就是 data URI，一律拦截会让图片全部裂掉。
+    // 仅白名单位图格式；svg+xml 可内嵌脚本，继续拦截。
+    return !/^data:image\/(png|jpe?g|gif|webp|bmp|avif);base64,/.test(stripped)
+  }
+  return false
 }
 
 /**
@@ -70,17 +73,26 @@ export function isDangerousUrl(value: string): boolean {
  * 3) href/src/xlink:href 值实体解码后做危险协议校验，命中则整个属性删除。
  */
 export function sanitizeHtml(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<(iframe|object|embed|form)[\s\S]*?<\/(?:iframe|object|embed|form)>/gi, '')
-    .replace(/<(iframe|object|embed|form)\b[^>]*\/?>/gi, '')
-    .replace(/\son\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
-    .replace(
-      /\s(?:href|src|xlink:href)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi,
-      (m, raw: string) => {
-        const unquoted = raw.replace(/^["']|["']$/g, '')
-        return isDangerousUrl(decodeEntities(unquoted)) ? '' : m
-      },
-    )
+  return (
+    html
+      // 成对块：整块删除
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[\s\S]*?<\/style>/gi, '')
+      // 未闭合的 script/style：删至末尾（此前只处理成对标签，
+      // `<style>body{display:none}` 这类未闭合块会原样输出并全局生效）
+      .replace(/<script\b[\s\S]*$/i, '')
+      .replace(/<style\b[\s\S]*$/i, '')
+      .replace(/<(iframe|object|embed|form)[\s\S]*?<\/(?:iframe|object|embed|form)>/gi, '')
+      .replace(/<(iframe|object|embed|form)\b[^>]*\/?>/gi, '')
+      // 事件属性：分隔符用 [\s/] —— HTML 解析器把 `/` 也当属性分隔符，
+      // 仅用 \s 会漏掉 `<img/onerror=alert(1)>`、`<img src=x/onerror=...>`（实测可绕过）
+      .replace(/[\s/]+on\w+\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+      .replace(
+        /[\s/]+(?:href|src|xlink:href)\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)/gi,
+        (m, raw: string) => {
+          const unquoted = raw.replace(/^["']|["']$/g, '')
+          return isDangerousUrl(decodeEntities(unquoted)) ? '' : m
+        },
+      )
+  )
 }

@@ -195,7 +195,9 @@ async function startLocal(f: number, t: number) {
       const item = selected[cursor++]
       if (!item) return
       try {
-        const res = await getBookContent(item.ch.url, props.origin || '')
+        // silent：批量拉取逐章请求失败由本弹窗汇总展示，
+        // 不走全局 toast（拦截器在 catch 之前弹，千章批量会叠出上百条把屏幕糊死）
+        const res = await getBookContent(item.ch.url, props.origin || '', { silent: true })
         const text = res.data?.content ?? ''
         if (text) {
           await saveLocalChapter({

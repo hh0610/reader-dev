@@ -1,9 +1,18 @@
 import { get, post } from './request'
 import type { Book, BookGroup, ReturnData } from '@/types'
 
-/** GET /reader3/getBookshelf（refresh=1 时先回写 can_update=1 的书最新章/总数） */
-export function getBookshelf(refresh = false): Promise<ReturnData<Book[]>> {
-  return get<Book[]>('/getBookshelf', refresh ? { refresh: 1 } : undefined)
+/**
+ * GET /reader3/getBookshelf（refresh=1 时先回写 can_update=1 的书最新章/总数）
+ *
+ * `refresh` 与 `opts.silent` 是两件事：前者触发服务端全量更新检查（慢，书多时可能超时），
+ * 后者只控制失败是否弹全局 toast。调用方曾把 silent 误传给 refresh，导致下拉刷新/快捷键
+ * 每次都触发服务端全量刷新并超时。
+ */
+export function getBookshelf(
+  refresh = false,
+  opts?: { silent?: boolean; timeout?: number },
+): Promise<ReturnData<Book[]>> {
+  return get<Book[]>('/getBookshelf', refresh ? { refresh: 1 } : undefined, opts)
 }
 
 /** POST /reader3/saveBook：入架/编辑（body = 完整 Book JSON，upsert） */
@@ -38,8 +47,8 @@ export function deleteBooks(bookUrls: string[], opts?: { silent?: boolean }): Pr
 }
 
 /** GET /reader3/getBookGroups：书架分组列表（契约：data [{id,name,orderNum,bookCount}]；后端当前输出 order） */
-export function getBookGroups(): Promise<ReturnData<BookGroup[]>> {
-  return get<BookGroup[]>('/getBookGroups')
+export function getBookGroups(opts?: { silent?: boolean }): Promise<ReturnData<BookGroup[]>> {
+  return get<BookGroup[]>('/getBookGroups', undefined, opts)
 }
 
 /**

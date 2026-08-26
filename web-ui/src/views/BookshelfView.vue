@@ -1368,9 +1368,15 @@ async function load(silent = false) {
   if (!silent) loading.value = true
   else refreshing.value = true
   try {
+    // silent 只控制「失败是否弹 toast」，不得当作 refresh 传给服务端（refresh=1 会
+    // 触发全量更新检查，书多时必然超时）；分组请求同样 silent，避免后端不可达时叠弹
     const [res, gRes] = await Promise.all([
-      getBookshelf(silent),
-      getBookGroups().catch(() => ({ isSuccess: false, errorMsg: '', data: [] as BookGroup[] })),
+      getBookshelf(false, { silent }),
+      getBookGroups({ silent: true }).catch(() => ({
+        isSuccess: false,
+        errorMsg: '',
+        data: [] as BookGroup[],
+      })),
     ])
     books.value = res.data ?? []
     groups.value = gRes.data ?? []
