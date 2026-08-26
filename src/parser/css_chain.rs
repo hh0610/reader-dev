@@ -110,8 +110,10 @@ fn css_chain_single(rule: &str, doc_html: &str) -> Vec<String> {
         if next.is_empty() {
             // E13（legacy AnalyzeByJSoup.getResultLast:214-256）：末段选择失败 →
             // 按**任意属性名**提取（img@srcset / video@poster / time@datetime /
-            // 自定义 data-* 等——不限于白名单）；提取为空再走原有回退
-            if i == last && !current.is_empty() {
+            // 自定义 data-* 等——不限于白名单）；提取为空再走原有回退。
+            // current 为空（根上下文）同样回退——裸 `@onclick` 等规则的上下文是
+            // 条目元素 HTML 本身（extract_attr 空上下文取文档首个含该属性的元素）
+            if i == last {
                 let by_attr = extract_attr(&doc, &current, part);
                 if !by_attr.is_empty() {
                     return by_attr;
@@ -612,6 +614,7 @@ fn is_attr_extractor(part: &str) -> bool {
             | "data-title"
             | "data-index"
             | "data-num"
+            | "onclick"
     ) || p.starts_with("data-")
         || p.starts_with("aria-")
 }
@@ -1508,6 +1511,22 @@ mod tests {
         // 属性去重
         let html2 = r#"<a href="/x">1</a><a href="/x">2</a>"#;
         assert_eq!(css_chain("a@href", html2), vec!["/x".to_string()]);
+    }
+
+    /// 裸 `@onclick`（根上下文取条目元素自身属性）——真实书源 bookUrl 常见形态：
+    /// `@onclick@js:result.match(...)`（搜索条目上下文 = 元素 HTML 本身）。
+    /// 回归：此前 onclick 不在白名单 + E13 回退要求 current 非空 → 静默空 →
+    /// bookUrl 回退成搜索页 URL → 详情/目录解析搜索页 → 「未获取到章节目录」
+    #[test]
+    fn test_bare_attr_onclick_root_context() {
+        let html = r#"<div class="v-list-item flex" onclick="newWebView('/b/231970.html', '', '')"><p class="v-title">书名</p></div>"#;
+        assert_eq!(
+            css_chain("@onclick", html),
+            vec!["newWebView('/b/231970.html', '', '')".to_string()]
+        );
+        // 任意非白名单属性同样可裸取（E13 根上下文回退）
+        let html2 = r#"<li custom-attr="x1">a</li>"#;
+        assert_eq!(css_chain("@custom-attr", html2), vec!["x1".to_string()]);
     }
 
     #[test]

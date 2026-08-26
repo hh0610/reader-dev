@@ -306,7 +306,9 @@ pub fn analyze_book_info(
     let html = html.as_str();
     // tocUrl 规则（legacy BookInfo.tocUrl 为完整字段规则）：
     // ① 选择器形态（CSS/XPath/JSONPath/@js 链）→ field 全量求值；
-    // ② 求值为空时回退 v1 直接路径/URL 拼接 + {{}} 内嵌模板展开
+    // ② 求值为空时回退 v1 直接路径/URL 拼接 + {{}} 内嵌模板展开——
+    //    仅限字面 URL/路径或含 {{}} 模板的规则；未命中的选择器规则不回退，
+    //    否则规则文本会被当 URL 泄漏（tocUrl=".../.sumchapter%20a@href" → 目录静默为空）
     let toc_url = rule
         .toc_url
         .as_deref()
@@ -314,8 +316,14 @@ pub fn analyze_book_info(
             let evaluated = crate::service::search::field_with_vars(html, Some(r), "", &mut vars);
             if !evaluated.is_empty() {
                 evaluated
-            } else {
+            } else if r.contains("{{")
+                || r.starts_with("http://")
+                || r.starts_with("https://")
+                || (r.starts_with('/') && !r.starts_with("//"))
+            {
                 crate::service::search::expand_embedded_with_vars(r, html, &vars)
+            } else {
+                String::new()
             }
         })
         .filter(|r| !r.is_empty())
@@ -1724,6 +1732,40 @@ mod tests {
         let html = r#"<h1 class="bookname">测试书</h1><p class="author">作者X</p>"#;
         let info = analyze_book_info("default", html, base, &src, base, None);
         assert_eq!(info.toc_url.as_deref(), Some(base), "tocUrl 应回退 baseUrl");
+    }
+
+    /// 回归：tocUrl 选择器规则未命中时不得把规则文本当字面 URL 回退
+    /// （此前 ".sumchapter a@href" 未命中 → tocUrl="http://.../.sumchapter%20a@href"
+    /// → getBookToc 解析垃圾页 → 目录静默为空）；应回退 baseUrl（详情页即目录页）
+    #[test]
+    fn test_analyze_info_toc_selector_miss_no_rule_leak() {
+        let mut src = test_source();
+        src.rule_book_info = Some(serde_json::json!({
+            "name": "h1.bookname@text",
+            "tocUrl": ".sumchapter a@href"
+        }));
+        let base = "http://127.0.0.1:9999/s/1.html?keyword=x";
+        let html = r#"<h1 class="bookname">书</h1>"#;
+        let info = analyze_book_info("default", html, base, &src, base, None);
+        assert_eq!(
+            info.toc_url.as_deref(),
+            Some(base),
+            "选择器未命中应回退 baseUrl，而非泄漏规则文本"
+        );
+        // 字面路径 / 模板形态回退不受影响
+        src.rule_book_info = Some(serde_json::json!({
+            "name": "h1.bookname@text",
+            "tocUrl": "/toc/{{$.id}}"
+        }));
+        let info2 = analyze_book_info(
+            "default",
+            r#"{"id":"9"}"#,
+            "http://127.0.0.1:9999/b/1",
+            &src,
+            "http://127.0.0.1:9999/b/1",
+            None,
+        );
+        assert_eq!(info2.toc_url.as_deref(), Some("http://127.0.0.1:9999/toc/9"));
     }
 
     /// legacy canReName：书源规则未声明 canReName 时保留书架已有书名/作者

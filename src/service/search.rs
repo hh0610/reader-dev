@@ -1992,6 +1992,33 @@ mod tests {
         assert_eq!(field(html, Some("tag.p@text@js:result + '!'"), ""), "正文!");
     }
 
+    /// 真实书源 bookUrl 形态：`@onclick@js:...`——条目元素自身 onclick 属性经 JS 提取
+    /// 跳转 URL（回归：onclick 裸属性此前静默空 → bookUrl 回退搜索页 URL →
+    /// 详情/目录解析搜索页 → 前端「未获取到章节目录」）
+    #[test]
+    fn test_field_onclick_attr_js_suffix_book_url() {
+        let item = r#"<div class="v-list-item flex" onclick="newWebView('/b/231970.html', '', '')"><p class="v-title">凡人修仙传</p></div>"#;
+        assert_eq!(
+            field(
+                item,
+                Some(r"@onclick@js:result.match(/\('(.*?)', '', ''\)/)[1]"),
+                ""
+            ),
+            "/b/231970.html"
+        );
+        let mut vars = RuleVars::new();
+        assert_eq!(
+            field_url_with_vars(
+                item,
+                Some(r"@onclick@js:result.match(/\('(.*?)', '', ''\)/)[1]"),
+                "",
+                "http://m.suixkan.com/s/1.html",
+                &mut vars
+            ),
+            "http://m.suixkan.com/b/231970.html"
+        );
+    }
+
     /// bookList 修复：JS 返回 JSON.parse(result).data 数组 → 逐本书解析（此前 ToString
     /// 输出 "[object Object]" 导致解析为空）
     #[test]

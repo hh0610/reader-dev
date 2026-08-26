@@ -3554,12 +3554,15 @@ async fn get_book_toc(
     .await
     {
         Ok(chapters) => {
-            // F-10：抓取成功后缓存目录（book_url 未知时以 toc_url 为键）
-            if let Ok(json) = serde_json::to_string(&chapters) {
-                let _ = state
-                    .storage
-                    .cache_toc(&namespace, &toc_url, &toc_url, &json)
-                    .await;
+            // F-10：抓取成功后缓存目录（book_url 未知时以 toc_url 为键）。
+            // 空目录不缓存——否则前端「未获取到章节目录→重试」在 TTL 内恒命中空缓存
+            if !chapters.is_empty() {
+                if let Ok(json) = serde_json::to_string(&chapters) {
+                    let _ = state
+                        .storage
+                        .cache_toc(&namespace, &toc_url, &toc_url, &json)
+                        .await;
+                }
             }
             // F8：成功回写 latestChapterTitle/totalChapterNum/lastCheckTime，清 lastCheckError
             if let Some(shelf) = shelf_for_write.as_ref() {
