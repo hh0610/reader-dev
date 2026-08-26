@@ -232,64 +232,112 @@ fn nav_links(html: &str, nav_path: &str) -> Vec<(String, String)> {
 }
 
 /// 解析 toc.ncx 的 navMap（navPoint 深度优先，含嵌套子点；标题取 navLabel/text）。
+/// 用 quick-xml 事件流解析（命名空间无关：`<navPoint>` / `<ncx:navPoint>` 均命中）。
+///
+/// 此前为手写字符串扫描，有两个缺陷：
+/// - `src` 用 `inner.find("content")` 后取第一个引号值 → 属性顺序变化即取错
+///   （`<content id=".." src="..">` 会读到 id 的值）；
+/// - 嵌套 navPoint 的 `</navPoint>` 匹配按"最近闭合"，嵌套时父点内容被截断。
+///
+/// 现按事件顺序深度优先输出（与 legado navMap 遍历顺序一致），标题取 `navLabel/text`、
+/// 链接取 `content/@src`。
 fn ncx_nav_points(xml: &str, ncx_path: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut stack: Vec<(usize, String)> = Vec::new();
-    // 简化解析：逐 navPoint 开闭标签处理（不引入 XML 依赖——EPUB2 NCX 结构固定）
-    let mut pos = 0usize;
-    while let Some(open) = xml[pos..].find("<navPoint") {
-        let open_abs = pos + open;
-        let tag_end = xml[open_abs..]
-            .find('>')
-            .map(|i| open_abs + i + 1)
-            .unwrap_or(xml.len());
-        // 自闭合 navPoint（罕见）跳过
-        if xml[open_abs..tag_end].ends_with("/>") {
-            pos = tag_end;
-            continue;
-        }
-        // 找对应 </navPoint>（先于下一个 <navPoint 的闭合——简单处理：从 tag_end 找最近 </navPoint>）
-        let content_start = tag_end;
-        let close_rel = xml[content_start..].find("</navPoint>");
-        let Some(close_rel) = close_rel else { break };
-        let close_abs = content_start + close_rel;
-        let inner = &xml[content_start..close_abs];
-        // 文本标签（不嵌套 navPoint——直接截取）
-        let text = if let Some(ti) = inner.find("<text>") {
-            let after = &inner[ti + 6..];
-            if let Some(te) = after.find("</text>") {
-                after[..te].trim().to_string()
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-        let src = if let Some(si) = inner.find("content") {
-            let after = &inner[si + 7..];
-            if let Some(q0) = after.find('"') {
-                let rest = &after[q0 + 1..];
-                if let Some(q1) = rest.find('"') {
-                    rest[..q1].to_string()
-                } else {
-                    String::new()
+    use quick_xml::events::Event;
+
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut buf = Vec::new();
+
+    // 结果按**文档顺序**（父先于子，深度优先）：进入 navPoint 时先占位，闭合时回填。
+    let mut slots: Vec<Option<(String, String)>> = Vec::new();
+    // 栈元素：(该 navPoint 的槽位下标, 标题, src)
+    let mut stack: Vec<(usize, String, String)> = Vec::new();
+    let mut in_text = false;
+    let mut text_buf = String::new();
+
+    let local = |q: &[u8]| -> String {
+        let s = String::from_utf8_lossy(q);
+        s.rsplit(':').next().unwrap_or(&s).to_ascii_lowercase()
+    };
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let name_owned = e.name();
+                match local(name_owned.as_ref()).as_str() {
+                    "navpoint" => {
+                        slots.push(None); // 文档顺序占位
+                        stack.push((slots.len() - 1, String::new(), String::new()));
+                    }
+                    // <content src="..."/>：按属性名取值（不再靠引号位置猜）
+                    "content" => {
+                        let src = e
+                            .attributes()
+                            .flatten()
+                            .find(|a| local(a.key.as_ref()) == "src")
+                            .and_then(|a| a.unescape_value().ok().map(|v| v.trim().to_string()))
+                            .unwrap_or_default();
+                        if let Some(top) = stack.last_mut() {
+                            if top.2.is_empty() {
+                                top.2 = src;
+                            }
+                        }
+                    }
+                    // navLabel/text：仅取当前 navPoint 自身标题（首个非空）
+                    "text" => {
+                        in_text = true;
+                        text_buf.clear();
+                    }
+                    _ => {}
                 }
-            } else {
-                String::new()
             }
-        } else {
-            String::new()
-        };
-        // 子 navPoint 的深度：inner 中若含 <navPoint 则为嵌套（父级在前），
-        // 简化：全部 navPoint 顺序输出（legado 也按 navPoint 出现顺序深度优先）
-        if !text.is_empty() && !src.is_empty() {
-            let href = src.split('#').next().unwrap_or(&src);
-            let full = resolve_opf_path(ncx_path, href);
-            out.push((full, text));
+            Ok(Event::Text(t)) => {
+                if in_text {
+                    if let Ok(s) = t.decode() {
+                        text_buf.push_str(&s);
+                    }
+                }
+            }
+            Ok(Event::CData(t)) => {
+                if in_text {
+                    text_buf.push_str(&String::from_utf8_lossy(t.as_ref()));
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name_owned = e.name();
+                match local(name_owned.as_ref()).as_str() {
+                    "text" => {
+                        in_text = false;
+                        let t = text_buf.trim().to_string();
+                        if !t.is_empty() {
+                            if let Some(top) = stack.last_mut() {
+                                if top.1.is_empty() {
+                                    top.1 = t;
+                                }
+                            }
+                        }
+                        text_buf.clear();
+                    }
+                    "navpoint" => {
+                        if let Some((slot, title, src)) = stack.pop() {
+                            if !title.is_empty() && !src.is_empty() {
+                                let href = src.split('#').next().unwrap_or(&src);
+                                slots[slot] = Some((resolve_opf_path(ncx_path, href), title));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break, // 畸形 ncx：保留已解析条目，不 panic
+            _ => {}
         }
-        let _ = &stack;
-        pos = close_abs + "</navPoint>".len();
+        buf.clear();
     }
+    // 按占位顺序回填 = 文档顺序（父先于子，深度优先，与 legado navMap 一致）
+    out.extend(slots.into_iter().flatten());
     out
 }
 
@@ -1495,12 +1543,73 @@ pub fn parse_pdf(bytes: &[u8]) -> Result<ImportedBook> {
         }
     }
     let chapters = chapters_from_pages(pages);
+    // 封面：首页内嵌图片（纯 lopdf，无原生依赖——不做整页渲染）。
+    // 扫描版 PDF 首页通常整页即一张图，取到即可用作封面；矢量排版页无内嵌图则无封面。
+    let cover = pdf_first_page_image(&doc);
     Ok(ImportedBook {
         meta,
         chapters,
-        cover: None,
+        cover,
         format: "pdf".into(),
     })
+}
+
+/// PDF 首页内嵌图片 → 封面字节（此前 PDF 导入恒无封面）。
+///
+/// 取首页 `Resources/XObject` 中第一个 `/Subtype /Image`：
+/// - `DCTDecode`（JPEG）/ `JPXDecode`（JP2）：流数据本身即完整图片文件，直接返回；
+/// - 其它滤镜（FlateDecode 位图等）：需按色彩空间重新编码，成本高且易出错 → 跳过。
+///
+/// 面积过小的图（图标/logo，< 100x100）跳过，避免把页眉小图当封面。
+fn pdf_first_page_image(doc: &lopdf::Document) -> Option<Vec<u8>> {
+    let (_, first_page_id) = doc.get_pages().into_iter().next()?;
+    let resources = doc.get_page_resources(first_page_id).ok()?.0?;
+    let xobjects = resources.get(b"XObject").ok()?;
+    let xobjects = match xobjects {
+        lopdf::Object::Reference(id) => doc.get_dictionary(*id).ok()?,
+        lopdf::Object::Dictionary(d) => d,
+        _ => return None,
+    };
+    for (_, obj) in xobjects.iter() {
+        let Ok(stream_id) = obj.as_reference() else {
+            continue;
+        };
+        let Ok(stream) = doc.get_object(stream_id).and_then(|o| o.as_stream()) else {
+            continue;
+        };
+        let dict = &stream.dict;
+        // 仅图片 XObject
+        if dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .map(|n| n != b"Image".as_slice())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let w = dict.get(b"Width").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0);
+        let h = dict.get(b"Height").ok().and_then(|o| o.as_i64().ok()).unwrap_or(0);
+        if w < 100 || h < 100 {
+            continue; // 图标/装饰小图，不作封面
+        }
+        // 滤镜：DCTDecode/JPXDecode 的原始流即完整图片文件
+        let filters: Vec<Vec<u8>> = match dict.get(b"Filter").ok() {
+            Some(lopdf::Object::Name(n)) => vec![n.clone()],
+            Some(lopdf::Object::Array(a)) => a
+                .iter()
+                .filter_map(|o| o.as_name().ok().map(|n| n.to_vec()))
+                .collect(),
+            _ => vec![],
+        };
+        let is_image_file = filters
+            .iter()
+            .any(|f| f.as_slice() == b"DCTDecode" || f.as_slice() == b"JPXDecode");
+        if is_image_file && !stream.content.is_empty() {
+            return Some(stream.content.clone());
+        }
+    }
+    None
 }
 
 /// PDF 元数据字符串解码（PDFDocEncoding/UTF-16BE/UTF-8；lopdf 0.44 Dictionary::get 返回 Result）
@@ -2785,13 +2894,66 @@ fn attr_value(block: &str, attr: &str) -> Option<String> {
 }
 
 /// OPF 相对路径 → zip 全路径
+/// EPUB 内部资源 href → zip 条目路径。
+///
+/// 归一化（对齐 komga normalize_epub_resource_href / EPUB OCF 规范）：
+/// ① 去 `#` 锚点；② percent-decode（`%20`/中文等编码路径）；③ 反斜杠转正斜杠；
+/// ④ 折叠 `.` / `..` 路径段。
+///
+/// 此前仅做 `目录 + '/' + href` 裸拼接：OPF/nav 位于子目录时的父级相对路径
+/// （`../images/cover.jpg`）拼出 `OEBPS/text/../images/cover.jpg` 匹配不到 zip 条目，
+/// 编码路径同样读不到 → 封面丢失 / 章节读取失败。
 fn resolve_opf_path(opf_path: &str, href: &str) -> String {
     let href_clean = href.split('#').next().unwrap_or(href);
-    if let Some(idx) = opf_path.rfind('/') {
+    let href_clean = percent_decode_path(href_clean).replace('\\', "/");
+    // 绝对路径（zip 根）：去掉前导 / 后直接归一化
+    let joined = if let Some(stripped) = href_clean.strip_prefix('/') {
+        stripped.to_string()
+    } else if let Some(idx) = opf_path.rfind('/') {
         format!("{}/{}", &opf_path[..idx], href_clean)
     } else {
-        href_clean.to_string()
+        href_clean.clone()
+    };
+    normalize_zip_path(&joined)
+}
+
+/// percent-decode（按字节解析 %XX——不对 &str 切片，避免多字节字符边界 panic）
+fn percent_decode_path(s: &str) -> String {
+    if !s.contains('%') {
+        return s.to_string();
     }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// zip 内路径归一化：折叠 `.` 与 `..` 段（`..` 越过根则丢弃），去重复斜杠
+fn normalize_zip_path(path: &str) -> String {
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s),
+        }
+    }
+    segs.join("/")
 }
 
 /// XHTML → 纯文本（保留段落）
@@ -4378,5 +4540,82 @@ mod tests {
             validate_mobi_lengths(&build_pdb_for_validation(1, 1_000, 10, 100, None)[..100])
                 .is_ok()
         );
+    }
+
+    /// 资源路径归一化：`../` 折叠 + percent-decode + 反斜杠（此前裸拼接读不到 zip 条目）
+    #[test]
+    fn test_resolve_opf_path_normalization() {
+        // OPF 在子目录，封面用父级相对路径
+        assert_eq!(
+            resolve_opf_path("OEBPS/text/content.opf", "../images/cover.jpg"),
+            "OEBPS/images/cover.jpg"
+        );
+        // 多级 ..
+        assert_eq!(
+            resolve_opf_path("a/b/c/content.opf", "../../x.xhtml"),
+            "a/x.xhtml"
+        );
+        // percent-encoding（空格/中文）
+        assert_eq!(
+            resolve_opf_path("OEBPS/content.opf", "text/ch%201.xhtml"),
+            "OEBPS/text/ch 1.xhtml"
+        );
+        assert_eq!(
+            resolve_opf_path("OEBPS/content.opf", "%E4%B8%AD%E6%96%87.xhtml"),
+            "OEBPS/中文.xhtml"
+        );
+        // `./` 与反斜杠、锚点
+        assert_eq!(
+            resolve_opf_path("OEBPS/content.opf", "./text/a.xhtml#frag"),
+            "OEBPS/text/a.xhtml"
+        );
+        assert_eq!(
+            resolve_opf_path("OEBPS/content.opf", "text\\b.xhtml"),
+            "OEBPS/text/b.xhtml"
+        );
+        // 常规相对路径不受影响
+        assert_eq!(
+            resolve_opf_path("OEBPS/content.opf", "text/ch1.xhtml"),
+            "OEBPS/text/ch1.xhtml"
+        );
+    }
+
+    /// ncx：按 content/@src 属性名取值——属性乱序时不再误取 id（此前取首个引号值）
+    #[test]
+    fn test_ncx_nav_points_attr_order_and_nesting() {
+        let ncx = r#"<ncx><navMap>
+            <navPoint id="p1" playOrder="1">
+              <navLabel><text>第一章</text></navLabel>
+              <content id="c1" src="text/ch1.xhtml"/>
+              <navPoint id="p1-1">
+                <navLabel><text>第一节</text></navLabel>
+                <content src="text/ch1.xhtml#s1"/>
+              </navPoint>
+            </navPoint>
+            <navPoint id="p2">
+              <navLabel><text>第二章</text></navLabel>
+              <content src="text/ch2.xhtml"/>
+            </navPoint>
+          </navMap></ncx>"#;
+        let pts = ncx_nav_points(ncx, "OEBPS/toc.ncx");
+        let titles: Vec<&str> = pts.iter().map(|(_, t)| t.as_str()).collect();
+        // 文档顺序（父先于子，深度优先）
+        assert_eq!(titles, vec!["第一章", "第一节", "第二章"]);
+        // src 取自 content/@src 而非 id（旧实现会取到 "c1"）
+        assert_eq!(pts[0].0, "OEBPS/text/ch1.xhtml");
+        assert_eq!(pts[2].0, "OEBPS/text/ch2.xhtml");
+    }
+
+    /// ncx 命名空间前缀（<ncx:navPoint>）同样解析
+    #[test]
+    fn test_ncx_nav_points_namespaced() {
+        let ncx = r#"<ncx:ncx xmlns:ncx="http://www.daisy.org/z3986/2005/ncx/"><ncx:navMap>
+            <ncx:navPoint><ncx:navLabel><ncx:text>章</ncx:text></ncx:navLabel>
+            <ncx:content src="a.xhtml"/></ncx:navPoint>
+          </ncx:navMap></ncx:ncx>"#;
+        let pts = ncx_nav_points(ncx, "OEBPS/toc.ncx");
+        assert_eq!(pts.len(), 1);
+        assert_eq!(pts[0].1, "章");
+        assert_eq!(pts[0].0, "OEBPS/a.xhtml");
     }
 }
