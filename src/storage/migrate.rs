@@ -31,6 +31,13 @@ pub async fn migrate_if_needed(storage: &Storage) -> Result<()> {
     if backfilled > 0 {
         tracing::info!("补全迁移书籍 toc_url：{backfilled} 本（从 raw_json 恢复 tocUrl）");
     }
+    // 历史缺陷补全：本地书章节此前写入时未绑定 user_namespace（落 'default' 桶），
+    // 而 get_chapter_content 按 ns 过滤 → secure 模式老库升级后本地书正文读不出。
+    // 按 books 表的归属把 default 桶里的章节行回填到真实命名空间，幂等。
+    let chapters_fixed = backfill_chapter_namespace(&storage.pool).await?;
+    if chapters_fixed > 0 {
+        tracing::info!("补全本地书章节命名空间：{chapters_fixed} 行（default → 实际用户）");
+    }
     // 管理员 default 残留个人数据回迁：管理员默认使用本人账号命名空间，
     // default 仅作系统配置层；若 default 中混入个人数据（书架/进度等），
     // 启动时归位到管理员本人命名空间，幂等。
@@ -319,6 +326,36 @@ async fn migrate_admin_default_personal_data_back(pool: &SqlitePool) -> Result<u
 
 /// 从 books.raw_json 恢复漏写的 toc_url（旧迁移版本未写 toc_url 字段）。
 /// 仅更新 toc_url 为空且有原始 tocUrl 的记录；返回补全数量。
+/// 本地书章节命名空间回填：把 `book_chapters` 中 `user_namespace='default'` 的行，
+/// 按 `books` 表中该 book_url 的真实归属改写为对应用户命名空间。
+///
+/// 背景：章节写入此前未绑定 ns（恒落 default 桶），而 `get_chapter_content` 按 ns 过滤读取
+/// → secure 模式（ns=用户名）下老库升级后本地书「目录能看、正文读不出」。
+///
+/// 安全约束（避免把公共/多归属数据错划给某个用户）：
+/// - 仅当该 book_url 在 books 表中**恰好属于唯一一个非 default 命名空间**时才回填；
+/// - 同一 book_url 被多个用户收藏（共享书）或本就属于 default → 保持不动。
+/// 幂等：回填后 default 桶不再有对应行，重复执行影响 0 行。
+async fn backfill_chapter_namespace(pool: &SqlitePool) -> Result<usize> {
+    let n = sqlx::query(
+        "UPDATE book_chapters SET user_namespace = (
+             SELECT b.user_namespace FROM books b
+             WHERE b.book_url = book_chapters.book_url AND b.user_namespace <> 'default'
+         )
+         WHERE user_namespace = 'default'
+           AND (SELECT COUNT(DISTINCT b2.user_namespace) FROM books b2
+                WHERE b2.book_url = book_chapters.book_url
+                  AND b2.user_namespace <> 'default') = 1
+           AND NOT EXISTS (SELECT 1 FROM books b3
+                WHERE b3.book_url = book_chapters.book_url
+                  AND b3.user_namespace = 'default')",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(n as usize)
+}
+
 async fn backfill_toc_url_from_raw(pool: &SqlitePool) -> Result<usize> {
     let rows: Vec<(String, String, String)> = sqlx::query_as(
         "SELECT book_url, user_namespace, raw_json FROM books \
@@ -504,13 +541,16 @@ async fn migrate_chapter_cache(
                     let Ok(content) = std::fs::read_to_string(&txt_path) else {
                         continue;
                     };
+                    // 绑定 user_namespace——get_chapter_content 按 ns 过滤读取，
+                    // 不绑则落 default 桶，secure 模式（ns=用户名）下读不出正文
                     sqlx::query(
-                        "INSERT OR REPLACE INTO book_chapters (book_url, chapter_index, title, content) VALUES (?1, ?2, ?3, ?4)",
+                        "INSERT OR REPLACE INTO book_chapters (book_url, chapter_index, title, content, user_namespace) VALUES (?1, ?2, ?3, ?4, ?5)",
                     )
                     .bind(&book_url)
                     .bind(idx)
                     .bind(&title)
                     .bind(&content)
+                    .bind(ns)
                     .execute(&mut *tx)
                     .await?;
                     inserted += 1;
@@ -2096,5 +2136,54 @@ mod tests {
         assert_eq!(count(pool, "book_groups").await, 2);
         assert_eq!(count(pool, "user_config").await, 3);
         cleanup(storage, "skip").await;
+    }
+
+    /// 章节命名空间回填：老库 default 桶的章节按 books 归属回填到真实用户
+    /// （secure 模式升级后本地书正文才读得出）；共享书/公共书保持不动。
+    #[tokio::test]
+    async fn test_backfill_chapter_namespace() {
+        let dir = test_dir("backfill-ns");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut config = AppConfig::from_env();
+        config.work_dir = dir.to_string_lossy().into_owned();
+        let storage = init(&config).await.unwrap();
+        let pool = &storage.pool;
+
+        // alice 独有书 + 章节落在 default 桶（老数据形态）
+        sqlx::query("INSERT INTO books (book_url, name, user_namespace) VALUES ('local://a', 'A', 'alice')")
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO book_chapters (book_url, chapter_index, title, content, user_namespace) VALUES ('local://a', 0, '章', '正文', 'default')")
+            .execute(pool).await.unwrap();
+        // 共享书（alice + bob 都有）→ 不回填，避免错划归属
+        sqlx::query("INSERT INTO books (book_url, name, user_namespace) VALUES ('https://s/1', 'S', 'alice')")
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO books (book_url, name, user_namespace) VALUES ('https://s/1', 'S', 'bob')")
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO book_chapters (book_url, chapter_index, title, content, user_namespace) VALUES ('https://s/1', 0, '章', '正文', 'default')")
+            .execute(pool).await.unwrap();
+        // 本就属于 default 的公共书 → 不动
+        sqlx::query("INSERT INTO books (book_url, name, user_namespace) VALUES ('local://pub', 'P', 'default')")
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO book_chapters (book_url, chapter_index, title, content, user_namespace) VALUES ('local://pub', 0, '章', '正文', 'default')")
+            .execute(pool).await.unwrap();
+
+        let n = backfill_chapter_namespace(pool).await.unwrap();
+        assert_eq!(n, 1, "只应回填 alice 独有书的 1 行");
+
+        let ns: String = sqlx::query_scalar("SELECT user_namespace FROM book_chapters WHERE book_url = 'local://a'")
+            .fetch_one(pool).await.unwrap();
+        assert_eq!(ns, "alice", "独有书章节应回填到 alice");
+        let ns2: String = sqlx::query_scalar("SELECT user_namespace FROM book_chapters WHERE book_url = 'https://s/1'")
+            .fetch_one(pool).await.unwrap();
+        assert_eq!(ns2, "default", "共享书不应回填");
+        let ns3: String = sqlx::query_scalar("SELECT user_namespace FROM book_chapters WHERE book_url = 'local://pub'")
+            .fetch_one(pool).await.unwrap();
+        assert_eq!(ns3, "default", "default 归属的书不应回填");
+
+        // 幂等：再跑一次影响 0 行
+        assert_eq!(backfill_chapter_namespace(pool).await.unwrap(), 0, "回填应幂等");
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
