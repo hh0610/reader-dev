@@ -531,6 +531,23 @@ fn opf_chapters<R: std::io::Read + std::io::Seek>(
     let spine_refs: Vec<String> = extract_all_attr(opf_str, "itemref", "idref");
     let manifest: std::collections::HashMap<String, (String, String)> = extract_manifest(opf_str);
     let mut chapters = Vec::new();
+    // 内联图片的累计预算（防图文书把整本图片塞进正文导致内存/响应爆炸）
+    let mut img_budget: u64 = MAX_EPUB_INLINE_IMAGE_BYTES;
+
+    // 章节 HTML → 正文（图片经 zip 解析后内联为 data URI）
+    let mut render = |zip: &mut zip::ZipArchive<R>, html: &str, chapter_path: &str, budget: &mut u64| {
+        html_to_text_with_images(html, |href| {
+            let path = resolve_opf_path(chapter_path, href);
+            let bytes = read_zip_limited(zip, &path, MAX_ZIP_ENTRY_BYTES).ok()?;
+            if bytes.is_empty() || bytes.len() as u64 > *budget {
+                return None;
+            }
+            *budget -= bytes.len() as u64;
+            let mime = image_mime(&path).unwrap_or("image/jpeg");
+            Some((bytes, mime))
+        })
+    };
+
     for idref in &spine_refs {
         let Some((href, mediatype)) = manifest.get(idref) else {
             continue;
@@ -542,8 +559,8 @@ fn opf_chapters<R: std::io::Read + std::io::Seek>(
         let Ok(content_bytes) = read_zip(zip, &full_path) else {
             continue;
         };
-        let html = String::from_utf8_lossy(&content_bytes);
-        let text = html_to_text(&html);
+        let html = String::from_utf8_lossy(&content_bytes).into_owned();
+        let text = render(zip, &html, &full_path, &mut img_budget);
         if text.trim().is_empty() {
             continue;
         }
@@ -557,14 +574,15 @@ fn opf_chapters<R: std::io::Read + std::io::Seek>(
         ));
     }
     if chapters.is_empty() {
-        for (href, mediatype) in manifest.values() {
+        let items: Vec<(String, String)> = manifest.values().cloned().collect();
+        for (href, mediatype) in items {
             if !mediatype.contains("xhtml") && !mediatype.contains("html") {
                 continue;
             }
-            let full_path = resolve_opf_path(opf_path, href);
+            let full_path = resolve_opf_path(opf_path, &href);
             if let Ok(content_bytes) = read_zip(zip, &full_path) {
-                let html = String::from_utf8_lossy(&content_bytes);
-                let text = html_to_text(&html);
+                let html = String::from_utf8_lossy(&content_bytes).into_owned();
+                let text = render(zip, &html, &full_path, &mut img_budget);
                 if !text.trim().is_empty() {
                     let title = extract_title(&html)
                         .unwrap_or_else(|| format!("第 {} 节", chapters.len() + 1));
@@ -3034,6 +3052,11 @@ const MAX_ZIP_ENTRY_BYTES: u64 = 500 * 1024 * 1024;
 /// P1-C3：CBZ 全部条目累计输出上限（与单条目同值）
 const MAX_CBZ_TOTAL_BYTES: u64 = 500 * 1024 * 1024;
 
+/// EPUB 正文内联图片的累计预算（整本）。图片以 base64 data URI 塞进章节正文，
+/// 体积约为原图 1.33 倍；图文书若全量内联会撑爆内存与响应体，故设总量上限，
+/// 超出后其余图片跳过（正文文字不受影响）。
+const MAX_EPUB_INLINE_IMAGE_BYTES: u64 = 80 * 1024 * 1024;
+
 /// P1-C3：MOBI 声称未压缩正文长度上限（解压前校验——Huffman 炸弹防护）
 const MAX_MOBI_TEXT_BYTES: u64 = 500 * 1024 * 1024;
 
@@ -3209,19 +3232,71 @@ fn normalize_zip_path(path: &str) -> String {
 
 /// XHTML → 纯文本（保留段落）
 fn html_to_text(html: &str) -> String {
-    let doc = scraper::Html::parse_document(html);
-    let mut parts = Vec::new();
+    html_to_text_with_images(html, |_| None)
+}
+
+/// XHTML → 正文（保留段落）+ **内联图片**。
+///
+/// `resolve_img(href) -> Some((字节, mime))` 用于把 `<img src>` / SVG `<image href>`
+/// 解析为图片数据；返回 None 则跳过该图。图片以 CBZ 同款 `![alt](data:mime;base64,…)`
+/// 输出（阅读器已支持该形式），与文本段落按文档顺序交错。
+///
+/// EPUB 封面页常是「body 内只有一张图」，此前图片被整体丢弃 → 阅读器只显示标题空页。
+fn html_to_text_with_images<F>(html: &str, mut resolve_img: F) -> String
+where
+    F: FnMut(&str) -> Option<(Vec<u8>, &'static str)>,
+{
+    use base64::Engine;
+    use scraper::node::Node;
+
+    // 先剥离 <style>/<script> 的内容再解析：EPUB 封面页常是
+    // `<head><style>@page{...}</style></head><body><svg><image/></svg></body>`，
+    // body 无文字 → 旧实现回退到「全文」把 CSS 当正文显示
+    // （生产实测：阅读器首章显示 `@page {padding: 0pt; margin:0pt}`）。
+    let cleaned = strip_style_script(html);
+    let doc = scraper::Html::parse_document(&cleaned);
+
+    let mut parts: Vec<String> = Vec::new();
     for el in doc.root_element().descendants() {
-        if let scraper::node::Node::Element(e) = el.value() {
-            // 跳过样式/脚本（EPUB 封面/内嵌 CSS 噪音）
-            if matches!(e.name(), "style" | "script") {
+        if let Node::Element(e) = el.value() {
+            let name = e.name();
+            if matches!(name, "style" | "script") {
                 continue;
             }
-            if matches!(e.name(), "p" | "div" | "h1" | "h2" | "h3" | "br" | "li") {
+            // 图片：<img src> / SVG <image href|xlink:href>
+            if matches!(name, "img" | "image") {
+                // 按属性 local-name 取值：SVG 的 xlink:href 带命名空间，
+                // e.attr("href")/e.attr("xlink:href") 都取不到（实测返回 None），
+                // 必须遍历 attrs() 比对 local-name。
+                let href = e
+                    .attrs()
+                    .find(|(k, _)| {
+                        let local = k.rsplit(':').next().unwrap_or(k);
+                        matches!(local, "src" | "href")
+                    })
+                    .map(|(_, v)| v)
+                    .unwrap_or("");
+                if !href.is_empty() {
+                    if let Some((bytes, mime)) = resolve_img(href) {
+                        let alt = e
+                            .attrs()
+                            .find(|(k, _)| k.rsplit(':').next().unwrap_or(k) == "alt")
+                            .map(|(_, v)| v)
+                            .filter(|a| !a.trim().is_empty())
+                            .unwrap_or("图片")
+                            // alt 避免前端 singleImageUrl 正则的 `]`/`)` 边界字符
+                            .replace([']', ')'], "-");
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        parts.push(format!("![{alt}](data:{mime};base64,{b64})"));
+                    }
+                }
+                continue;
+            }
+            if matches!(name, "p" | "div" | "h1" | "h2" | "h3" | "br" | "li") {
                 let text = el
                     .descendants()
                     .filter_map(|d| match d.value() {
-                        scraper::node::Node::Text(t) => Some(t.text.trim().to_string()),
+                        Node::Text(t) => Some(t.text.trim().to_string()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -3235,7 +3310,6 @@ fn html_to_text(html: &str) -> String {
         }
     }
     if parts.is_empty() {
-        // fallback：body 全部文本
         return doc
             .root_element()
             .text()
@@ -3244,6 +3318,32 @@ fn html_to_text(html: &str) -> String {
             .to_string();
     }
     parts.join("\n\n")
+}
+
+/// 剥离 `<style>…</style>` / `<script>…</script>`（含标签与内容），大小写无关。
+/// 未闭合时丢弃其后剩余内容（畸形 HTML 的样式块不应作为正文）。
+fn strip_style_script(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let lower = html.to_ascii_lowercase();
+    let mut i = 0usize;
+    while i < html.len() {
+        // 找下一个 <style 或 <script
+        let next = ["<style", "<script"]
+            .iter()
+            .filter_map(|tag| lower[i..].find(tag).map(|p| (i + p, *tag)))
+            .min_by_key(|(p, _)| *p);
+        let Some((pos, tag)) = next else {
+            out.push_str(&html[i..]);
+            break;
+        };
+        out.push_str(&html[i..pos]);
+        let close = if tag == "<style" { "</style>" } else { "</script>" };
+        match lower[pos..].find(close) {
+            Some(rel) => i = pos + rel + close.len(),
+            None => break, // 未闭合：丢弃其后全部
+        }
+    }
+    out
 }
 
 /// 提取 <title>（优先 h1/h2，其次 head title）
@@ -5023,4 +5123,76 @@ mod tests {
         );
         assert_eq!(book.cover.as_deref(), Some(&jpeg_bytes[..]), "首页图应作封面");
     }
+
+    /// 生产实测回归：EPUB 封面页的 <style> CSS 不得被当成正文显示
+    /// （封面页 body 常只有图片无文字 → 旧实现回退「全文」把 @page{...} 输出）
+    #[test]
+    fn test_html_to_text_excludes_style_css() {
+        let html = r#"<html><head><title>Cover</title>
+            <style type="text/css">@page {padding: 0pt; margin:0pt}
+            body { text-align: center; padding:0pt; margin: 0pt; }</style></head>
+            <body><div><svg><image href="cover.jpg"/></svg></div></body></html>"#;
+        let text = html_to_text(html);
+        assert!(!text.contains("@page"), "CSS 不应出现在正文: {text:?}");
+        assert!(!text.contains("padding"), "CSS 不应出现在正文: {text:?}");
+        assert!(!text.contains("text-align"), "CSS 不应出现在正文: {text:?}");
+    }
+
+    /// 正文中的 style/script 块同样剥离，但正常文字保留
+    #[test]
+    fn test_html_to_text_keeps_body_text() {
+        let html = r#"<html><head><style>p{color:red}</style></head>
+            <body><p>第一段正文</p><script>var x=1;</script><p>第二段正文</p></body></html>"#;
+        let text = html_to_text(html);
+        assert!(text.contains("第一段正文") && text.contains("第二段正文"), "{text:?}");
+        assert!(!text.contains("color:red") && !text.contains("var x"), "{text:?}");
+    }
+
+    #[test]
+    fn test_strip_style_script_unclosed() {
+        // 未闭合 style：丢弃其后内容，不把 CSS 当正文
+        let out = strip_style_script("<p>正文</p><style>body{x}");
+        assert!(out.contains("正文") && !out.contains("body{x}"), "{out:?}");
+        // 大小写无关
+        let out2 = strip_style_script("<STYLE>a{}</STYLE><p>文</p>");
+        assert!(!out2.contains("a{}") && out2.contains("文"), "{out2:?}");
+    }
+
+    /// EPUB 封面页（body 内只有一张图）应内联图片，而非只剩标题空页
+    #[test]
+    fn test_html_to_text_inlines_images() {
+        let html = r#"<html><head><style>@page{margin:0}</style></head>
+            <body><div><img src="images/cover.jpg" alt="封面"/></div>
+            <p>正文一段</p></body></html>"#;
+        let png = vec![0x89u8, b'P', b'N', b'G'];
+        let out = html_to_text_with_images(html, |href| {
+            assert_eq!(href, "images/cover.jpg");
+            Some((png.clone(), "image/jpeg"))
+        });
+        assert!(out.contains("![封面](data:image/jpeg;base64,"), "应内联图片: {out:?}");
+        assert!(out.contains("正文一段"), "文字应保留: {out:?}");
+        assert!(!out.contains("@page"), "CSS 不应出现: {out:?}");
+    }
+
+    /// SVG 形式的封面（<svg><image xlink:href>）同样内联
+    #[test]
+    fn test_html_to_text_inlines_svg_image() {
+        let html = r#"<html><body><svg viewBox="0 0 600 800">
+            <image width="600" height="800" xlink:href="cover.jpeg"/></svg></body></html>"#;
+        let out = html_to_text_with_images(html, |href| {
+            assert!(href.ends_with("cover.jpeg"), "href={href}");
+            Some((vec![1, 2, 3], "image/jpeg"))
+        });
+        assert!(out.contains("(data:image/jpeg;base64,"), "SVG image 应内联: {out:?}");
+    }
+
+    /// 解析不到的图片跳过，不产生空标记
+    #[test]
+    fn test_html_to_text_missing_image_skipped() {
+        let html = r#"<body><img src="missing.png"/><p>文字</p></body>"#;
+        let out = html_to_text_with_images(html, |_| None);
+        assert!(!out.contains("data:"), "取不到的图片不应留标记: {out:?}");
+        assert!(out.contains("文字"));
+    }
+
 }
