@@ -1566,7 +1566,13 @@ pub fn parse_pdf(bytes: &[u8]) -> Result<ImportedBook> {
         }
     }
     if pages.iter().all(|p| p.trim().is_empty()) {
-        anyhow::bail!("PDF 未提取到文本（扫描版/图片型 PDF 暂不支持 OCR）");
+        // 无文本层 = 扫描版 PDF。此前直接报错（整本书无法导入）；现回退为**图片型书**：
+        // 每页的内嵌图片作为一章（与 CBZ 同样的 base64 data URI 表示），可翻页阅读。
+        // 仍无图片（空白/矢量无文本）才报错。
+        if let Some(book) = parse_pdf_as_images(&doc, limit) {
+            return Ok(book);
+        }
+        anyhow::bail!("PDF 未提取到文本（扫描版无内嵌图片，或需 OCR）");
     }
     // 元数据（Info 字典）
     let mut meta = OpfMeta::default();
@@ -1667,6 +1673,96 @@ fn pdf_first_page_image(doc: &lopdf::Document) -> Option<Vec<u8>> {
             continue;
         }
         return Some(stream.content.clone());
+    }
+    None
+}
+
+/// 扫描版 PDF → 图片型书（每页内嵌图片一章，与 CBZ 同表示：`![页N](data:image/…;base64,…)`）。
+///
+/// 触发条件：全书提取不到文本层。仅取每页**单一 DCTDecode/JPXDecode** 的图片流
+/// （其原始字节即完整 JPEG/JP2 文件，无需重编码）；累计体积超 [`MAX_CBZ_TOTAL_BYTES`]
+/// 即停止（防超大扫描件耗尽内存）。一页都取不到 → None（调用方报错）。
+fn parse_pdf_as_images(doc: &lopdf::Document, limit: usize) -> Option<ImportedBook> {
+    use base64::Engine;
+    let pages = doc.get_pages();
+    let mut chapters: Vec<Chapter> = Vec::new();
+    let mut cover: Option<Vec<u8>> = None;
+    let mut total: u64 = 0;
+    for (idx, (pno, pid)) in pages.iter().take(limit).enumerate() {
+        let Some((img, mime)) = pdf_page_image(doc, *pid) else {
+            continue;
+        };
+        total = total.saturating_add(img.len() as u64);
+        if total > MAX_CBZ_TOTAL_BYTES {
+            tracing::warn!(
+                "扫描版 PDF 图片累计超过 {} MB，截断于第 {} 页",
+                MAX_CBZ_TOTAL_BYTES / 1024 / 1024,
+                idx + 1
+            );
+            break;
+        }
+        if cover.is_none() {
+            cover = Some(img.clone());
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&img);
+        chapters.push(Chapter {
+            title: format!("第 {pno} 页"),
+            content: format!("![第 {pno} 页](data:{mime};base64,{b64})"),
+        });
+    }
+    if chapters.is_empty() {
+        return None;
+    }
+    tracing::info!("扫描版 PDF 按图片型导入：{} 页", chapters.len());
+    Some(ImportedBook {
+        meta: OpfMeta::default(),
+        chapters,
+        cover,
+        format: "pdf".into(),
+    })
+}
+
+/// 取某页的单一图片流（DCTDecode→image/jpeg，JPXDecode→image/jp2）；
+/// 多滤镜链（流仍被前置滤镜压着）与非图片 XObject 跳过。返回 (字节, mime)。
+fn pdf_page_image(doc: &lopdf::Document, page_id: lopdf::ObjectId) -> Option<(Vec<u8>, &'static str)> {
+    let resources = doc.get_page_resources(page_id).ok()?.0?;
+    let xobjects = match resources.get(b"XObject").ok()? {
+        lopdf::Object::Reference(id) => doc.get_dictionary(*id).ok()?,
+        lopdf::Object::Dictionary(d) => d,
+        _ => return None,
+    };
+    for (_, obj) in xobjects.iter() {
+        let Ok(sid) = obj.as_reference() else { continue };
+        let Ok(stream) = doc.get_object(sid).and_then(|o| o.as_stream()) else {
+            continue;
+        };
+        let dict = &stream.dict;
+        if dict
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| o.as_name().ok())
+            .map(|n| n != b"Image".as_slice())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let filters: Vec<Vec<u8>> = match dict.get(b"Filter").ok() {
+            Some(lopdf::Object::Name(n)) => vec![n.clone()],
+            Some(lopdf::Object::Array(a)) => a
+                .iter()
+                .filter_map(|o| o.as_name().ok().map(|n| n.to_vec()))
+                .collect(),
+            _ => vec![],
+        };
+        if filters.len() != 1 || stream.content.is_empty() {
+            continue;
+        }
+        let mime = match filters[0].as_slice() {
+            b"DCTDecode" => "image/jpeg",
+            b"JPXDecode" => "image/jp2",
+            _ => continue,
+        };
+        return Some((stream.content.clone(), mime));
     }
     None
 }
@@ -4876,5 +4972,55 @@ mod tests {
         // 上页正常收尾 → 空行分段
         let pages2 = vec!["第一段。".to_string(), "第二段。".to_string()];
         assert_eq!(join_pdf_pages(&pages2), "第一段。\n\n第二段。");
+    }
+
+    /// 扫描版 PDF（无文本层，每页一张内嵌 JPEG）→ 图片型书回退，
+    /// 而非报错「暂不支持 OCR」（此前整本无法导入）
+    #[test]
+    fn test_parse_pdf_scanned_falls_back_to_images() {
+        // 构造：1 页，页面资源含一张 DCTDecode 图片（内容为最小 JPEG 头字节即可）
+        use lopdf::{dictionary, Document, Object, Stream};
+        let mut doc = Document::with_version("1.5");
+        let jpeg_bytes = vec![0xFFu8, 0xD8, 0xFF, 0xE0, 0x00, 0x10, b'J', b'F', b'I', b'F'];
+        let img_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 983i64,
+                "Height" => 1476i64,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8i64,
+                "Filter" => "DCTDecode",
+            },
+            jpeg_bytes.clone(),
+        ));
+        let pages_id = doc.new_object_id();
+        let content_id = doc.add_object(Stream::new(dictionary! {}, b"".to_vec()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im1" => img_id } },
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Count" => 1i64, "Kids" => vec![page_id.into()],
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).unwrap();
+
+        let book = parse_pdf(&buf).expect("扫描版 PDF 应回退为图片型书而非报错");
+        assert_eq!(book.chapters.len(), 1, "每页一章");
+        assert!(
+            book.chapters[0].content.starts_with("![第 1 页](data:image/jpeg;base64,"),
+            "应为 CBZ 同款 data URI 图片: {}",
+            book.chapters[0].content.chars().take(60).collect::<String>()
+        );
+        assert_eq!(book.cover.as_deref(), Some(&jpeg_bytes[..]), "首页图应作封面");
     }
 }
