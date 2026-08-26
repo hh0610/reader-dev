@@ -628,8 +628,19 @@ fn read_local_cover(storage: &Storage, ns: &str, cover_url: Option<&str>) -> Opt
     if !rest.starts_with(&format!("{ns}/covers/")) {
         return None;
     }
-    let path = storage.config.storage_dir().join("assets").join(rest);
-    std::fs::read(path).ok()
+    // H8：拒绝 `..` 段并 canonicalize + 容器校验——否则保持 `{ns}/covers/` 前缀的
+    // `../../../../etc/passwd` 可穿越出封面目录，被读入生成的 EPUB 再经 OPDS 取回。
+    if rest.split(['/', '\\']).any(|seg| seg == "..") {
+        return None;
+    }
+    let assets_root = storage.config.storage_dir().join("assets");
+    let path = assets_root.join(rest);
+    let abs = path.canonicalize().ok()?;
+    let root_abs = assets_root.canonicalize().unwrap_or(assets_root);
+    if !abs.starts_with(&root_abs) || !abs.is_file() {
+        return None;
+    }
+    std::fs::read(abs).ok()
 }
 
 /// 文件名净化（去路径分隔符/非法字符；保留中文与扩展名语义）

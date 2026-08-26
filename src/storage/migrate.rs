@@ -238,6 +238,18 @@ pub async fn migrate_if_needed(storage: &Storage) -> Result<()> {
 /// 订阅/RSS 源/TXT 目录规则/HttpTTS/分组）保留在 default 供系统配置。
 /// 幂等：本人命名空间已有相同业务键时保留本人行并清理 default 残留行。
 async fn migrate_admin_default_personal_data_back(pool: &SqlitePool) -> Result<usize> {
+    // M15：一次性标记——此前每次启动都执行，其 drop_sql 会删除 default 命名空间下
+    // 与管理员冲突/新增的个人数据行（破坏性、不可逆）。管理员若刻意用 ns=default
+    // 存个人数据，重启即被搬走/删除。用 system_settings 记标记，仅首次执行。
+    const MARKER: &str = "migrate_admin_default_personal_data_back.done";
+    let done: Option<String> =
+        sqlx::query_scalar("SELECT value FROM system_settings WHERE key = ?1")
+            .bind(MARKER)
+            .fetch_optional(pool)
+            .await?;
+    if done.is_some() {
+        return Ok(0);
+    }
     let admins: Vec<String> = sqlx::query_scalar(
         "SELECT username FROM users WHERE is_admin = 1 AND username != 'default' \
          ORDER BY created_at, username",
@@ -245,6 +257,7 @@ async fn migrate_admin_default_personal_data_back(pool: &SqlitePool) -> Result<u
     .fetch_all(pool)
     .await?;
     let Some(username) = admins.first() else {
+        // 尚无管理员——不写标记，留待有管理员时首次迁移
         return Ok(0);
     };
 
@@ -295,6 +308,11 @@ async fn migrate_admin_default_personal_data_back(pool: &SqlitePool) -> Result<u
             .rows_affected();
         total += (moved + dropped) as usize;
     }
+    // 写一次性标记（与迁移同事务，保证要么都成要么都回滚）
+    sqlx::query("INSERT OR REPLACE INTO system_settings (key, value) VALUES (?1, '1')")
+        .bind(MARKER)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(total)
 }

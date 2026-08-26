@@ -81,11 +81,29 @@ pub(crate) fn resolve_secure_path(base: &Path, rel: &str) -> Option<PathBuf> {
             other => out.push(other.as_os_str()),
         }
     }
-    if out.starts_with(&base_abs) {
-        Some(out)
-    } else {
-        None
+    if !out.starts_with(&base_abs) {
+        return None;
     }
+    // L4：词法归一化挡不住 base 内指向外部的符号链接（如 base/link -> /etc）。
+    // canonicalize 最深的已存在祖先并复核容器（写入场景 leaf 尚不存在，故只解析已存在部分；
+    // 未存在的剩余段不可能是符号链接）。
+    let mut probe = out.as_path();
+    loop {
+        match probe.canonicalize() {
+            Ok(real) => {
+                if !real.starts_with(&base_abs) {
+                    return None;
+                }
+                break;
+            }
+            Err(_) => match probe.parent() {
+                Some(p) if p.starts_with(&base_abs) && p != probe => probe = p,
+                // 到达 base 或无更浅祖先：已存在部分校验完毕
+                _ => break,
+            },
+        }
+    }
+    Some(out)
 }
 
 /// home 语义解析（legacy checkAccess）：返回允许访问的根目录（自动建目录）

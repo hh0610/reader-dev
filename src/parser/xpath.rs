@@ -4,8 +4,13 @@
 //! - 常见 HTML 命名实体（&nbsp; 等）归一为字符——sxd 仅支持 XML 预定义实体与数字引用
 //! - `<td>`/`<tr>`/`<tbody>` 结尾片段自动包裹（表格行/单元格可直接 XPath）
 //!
-//! 残余限制：sxd-document 为严格 XML 解析器——非良构 HTML（未闭合标签等）无法解析；
-//! legado 侧 JsoupXpath 基于 jsoup HTML 解析器可容错。规避：规则链中先用 CSS 定位再 XPath。
+//! - HTML→良构 XML 归一化（[`html_to_wellformed`]）：严格 XML 解析失败时重试——补 void
+//!   元素自闭合（`<br>`→`<br/>`）、无引号属性补引号（`href=/x`→`href="/x"`），让 legado
+//!   常见的 `@XPath://div[@id='list']/a/@href` 在真实 HTML 上也能命中。
+//!
+//! 残余限制：sxd-document 为严格 XML 解析器，归一化为务实子集——真正未闭合的块级标签
+//! （`<div><p>…`）、`<script>` 原始文本等仍无法解析（需 jsoup 级 HTML 解析器）；此类
+//! 输入归一化后仍失败即回退空列表。规避：规则链中先用 CSS 定位再 XPath。
 
 use sxd_document::parser;
 use sxd_xpath::nodeset::Node;
@@ -17,9 +22,20 @@ pub fn xpath_select(rule: &str, xml: &str) -> Vec<String> {
     let wrapped = wrap_fragments(&normalized);
     let package = match parser::parse(&wrapped) {
         Ok(p) => p,
-        Err(e) => {
-            tracing::debug!("XPath 文档解析失败: {e}");
-            return vec![];
+        Err(_) => {
+            // 严格 XML 解析失败：多为 legado 真实书源的非良构 HTML（void 元素未自闭合、
+            // 属性未加引号）。先做 HTML→良构 XML 归一化再重试——务实子集，仅在严格解析
+            // 已失败时启用，不影响本就是合法 XML/XHTML 的输入（保持既有 <link>…</link>
+            // 等容器元素语义）。
+            let repaired = html_to_wellformed(&normalized);
+            let wrapped2 = wrap_fragments(&repaired);
+            match parser::parse(&wrapped2) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!("XPath 文档解析失败（含 HTML 归一化重试）: {e}");
+                    return vec![];
+                }
+            }
         }
     };
     let document = package.as_document();
@@ -236,6 +252,210 @@ fn wrap_fragments(xml: &str) -> String {
         s = format!("<table>{s}</table>");
     }
     s
+}
+
+/// HTML void 元素（无闭合标签；严格 XML 视其为未闭合而整体解析失败）
+const VOID_ELEMENTS: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
+];
+
+/// HTML → 良构 XML 归一化（务实子集，覆盖 legado 真实书源最常见的两类非良构写法）：
+/// 1. void 元素补自闭合：`<br>`/`<img …>`/`<meta …>` → `<br/>`/`<img …/>`/`<meta …/>`
+/// 2. 未加引号的属性值补双引号：`<a href=/x>` → `<a href="/x">`；无值属性补 `=""`
+///
+/// 仅在严格 XML 解析已失败时调用（见 [`xpath_select`]），因此不会误伤把 void 名当容器
+/// 用的合法 XML（如 `<link>…</link>`——那类输入首轮即解析成功，不进本函数）。
+///
+/// **未覆盖**（需完整 HTML DOM 解析器如 jsoup/html5ever，本函数不处理，解析仍失败→空）：
+/// 真正未闭合的块级标签（`<div><p>…`）、标签大小写归一、`<script>`/`<style>` 内含 `<`/`&`
+/// 的原始文本、无引号且含 `<`/`&` 的属性值等。注释/DOCTYPE/处理指令原样透传。
+fn html_to_wellformed(html: &str) -> String {
+    let b = html.as_bytes();
+    let mut out = String::with_capacity(html.len() + 16);
+    let mut i = 0usize;
+    while i < html.len() {
+        if b[i] == b'<' {
+            let rest = &html[i..];
+            // 注释：透传到 `-->`（XML 注释同样以此界定）
+            if rest.starts_with("<!--") {
+                match rest.find("-->") {
+                    Some(end) => {
+                        out.push_str(&html[i..i + end + 3]);
+                        i += end + 3;
+                    }
+                    None => {
+                        out.push_str(rest);
+                        i = html.len();
+                    }
+                }
+                continue;
+            }
+            // DOCTYPE / 处理指令 / CDATA 声明：透传到 `>`
+            if rest.starts_with("<!") || rest.starts_with("<?") {
+                match rest.find('>') {
+                    Some(end) => {
+                        out.push_str(&html[i..i + end + 1]);
+                        i += end + 1;
+                    }
+                    None => {
+                        out.push_str(rest);
+                        i = html.len();
+                    }
+                }
+                continue;
+            }
+            // 闭合标签 `</name>`：透传到 `>`
+            if rest.starts_with("</") {
+                match rest.find('>') {
+                    Some(end) => {
+                        out.push_str(&html[i..i + end + 1]);
+                        i += end + 1;
+                    }
+                    None => {
+                        out.push_str(rest);
+                        i = html.len();
+                    }
+                }
+                continue;
+            }
+            // 起始标签：归一化（void 自闭合 + 属性补引号）
+            if let Some((next, tag)) = scan_start_tag(html, i) {
+                out.push_str(&tag);
+                i = next;
+                continue;
+            }
+            // `<` 非标签起始（如文本里的裸 `<`）——原样保留（本就非良构，解析仍失败→空）
+            out.push('<');
+            i += 1;
+            continue;
+        }
+        let ch = html[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// 扫描起始标签 `<name …>`，返回 (标签结束后的字节位置, 归一化后的标签串)。
+/// 非标签（`<` 后非 ASCII 字母）返回 None。按字节定位 ASCII 定界符——UTF-8 续字节
+/// 均 ≥0x80，不会与定界符冲突，中文属性值/文本安全。
+fn scan_start_tag(html: &str, start: usize) -> Option<(usize, String)> {
+    let b = html.as_bytes();
+    let mut i = start + 1;
+    if i >= html.len() || !b[i].is_ascii_alphabetic() {
+        return None;
+    }
+    let name_start = i;
+    while i < html.len()
+        && (b[i].is_ascii_alphanumeric() || b[i] == b'-' || b[i] == b':' || b[i] == b'_')
+    {
+        i += 1;
+    }
+    let name = &html[name_start..i];
+
+    let mut attrs = String::new();
+    let mut self_closed = false;
+    loop {
+        let loop_start = i;
+        while i < html.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= html.len() {
+            break; // 未闭合标签：尽力而为
+        }
+        if b[i] == b'>' {
+            i += 1;
+            break;
+        }
+        if b[i] == b'/' {
+            // `/>` 自闭合（`/` 出现在属性名位置，非无引号值内部）
+            self_closed = true;
+            i += 1;
+            while i < html.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < html.len() && b[i] == b'>' {
+                i += 1;
+            }
+            break;
+        }
+        // 属性名：读到 空白 / `=` / `>` / `/`
+        let attr_name_start = i;
+        while i < html.len()
+            && !b[i].is_ascii_whitespace()
+            && b[i] != b'='
+            && b[i] != b'>'
+            && b[i] != b'/'
+        {
+            i += 1;
+        }
+        let attr_name = &html[attr_name_start..i];
+        while i < html.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < html.len() && b[i] == b'=' {
+            i += 1;
+            while i < html.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < html.len() && (b[i] == b'"' || b[i] == b'\'') {
+                // 引号值：原样保留（含原引号字符；已引号即良构）
+                let quote = b[i];
+                let vstart = i + 1;
+                i += 1;
+                while i < html.len() && b[i] != quote {
+                    i += 1;
+                }
+                let value = &html[vstart..i.min(html.len())];
+                if i < html.len() {
+                    i += 1; // 跳过闭合引号
+                }
+                if !attr_name.is_empty() {
+                    attrs.push(' ');
+                    attrs.push_str(attr_name);
+                    attrs.push('=');
+                    attrs.push(quote as char);
+                    attrs.push_str(value);
+                    attrs.push(quote as char);
+                }
+            } else {
+                // 无引号值：读到 空白 / `>`（HTML 无引号值可含 `/`，故不在此断开）→ 补双引号
+                let vstart = i;
+                while i < html.len() && !b[i].is_ascii_whitespace() && b[i] != b'>' {
+                    i += 1;
+                }
+                let value = &html[vstart..i];
+                if !attr_name.is_empty() {
+                    attrs.push(' ');
+                    attrs.push_str(attr_name);
+                    attrs.push_str("=\"");
+                    attrs.push_str(value);
+                    attrs.push('"');
+                }
+            }
+        } else if !attr_name.is_empty() {
+            // 无值属性（如 `<input disabled>`）：XML 需补空值
+            attrs.push(' ');
+            attrs.push_str(attr_name);
+            attrs.push_str("=\"\"");
+        }
+        if i == loop_start {
+            i += 1; // 保底推进，杜绝畸形输入死循环
+        }
+    }
+
+    let is_void = VOID_ELEMENTS.contains(&name.to_ascii_lowercase().as_str());
+    let mut tag = String::with_capacity(name.len() + attrs.len() + 3);
+    tag.push('<');
+    tag.push_str(name);
+    tag.push_str(&attrs);
+    if self_closed || is_void {
+        tag.push_str("/>");
+    } else {
+        tag.push('>');
+    }
+    Some((i, tag))
 }
 
 fn value_to_strings(value: &Value) -> Vec<String> {
@@ -464,8 +684,38 @@ mod tests {
     }
 
     #[test]
-    fn xpath_non_wellformed_html_returns_empty() {
-        // 非良构 HTML（未闭合标签）→ sxd 解析失败 → 空（残余限制，见模块注释）
+    fn xpath_real_html_normalized() {
+        // legado 真实书源常见非良构：void 元素 <br>/<img> 未自闭合 + 属性未加引号
+        // → 严格 XML 解析失败，HTML 归一化后重试命中（覆盖 @XPath://div[@id='list']/a/@href）
+        let html = r#"<div id="list"><a href="/book/1">第1章</a><br><a href=/book/2>第2章</a><img src="c.jpg"></div>"#;
+        assert_eq!(
+            xpath_select("//div[@id='list']/a/@href", html),
+            vec!["/book/1", "/book/2"]
+        );
+        assert_eq!(
+            xpath_select("//div[@id='list']/a/text()", html),
+            vec!["第1章", "第2章"]
+        );
+        // void 元素 <meta>/<hr>（含无引号属性）补自闭合后不破坏解析
+        let html2 = r#"<div><meta charset=utf-8><hr><p>正文段</p></div>"#;
+        assert_eq!(xpath_select("//div/p/text()", html2), vec!["正文段"]);
+    }
+
+    #[test]
+    fn xpath_wellformed_xml_untouched() {
+        // 合法 XML 首轮即解析成功，不进归一化路径——void 名当容器用的语义保持
+        // （<link> 在 HTML 是 void，但此处是 XML 容器元素，含 @href 与子文本）
+        let xml = r#"<r><link href="https://a/1">链接一</link><link href="https://a/2">链接二</link></r>"#;
+        assert_eq!(
+            xpath_select("//link/@href", xml),
+            vec!["https://a/1", "https://a/2"]
+        );
+        assert_eq!(xpath_select("//link/text()", xml), vec!["链接一", "链接二"]);
+    }
+
+    #[test]
+    fn xpath_truly_unclosed_still_empty() {
+        // 归一化覆盖范围不含真正未闭合的块级标签（需完整 HTML DOM 解析器）——仍回退空
         let html = "<div><p>未闭合";
         assert!(xpath_select("//p/text()", html).is_empty());
     }

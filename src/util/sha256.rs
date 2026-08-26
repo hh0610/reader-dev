@@ -26,14 +26,18 @@ pub fn hash_password(password: &str, salt: &str) -> String {
     sha256_hex(&format!("{salt}{password}"))
 }
 
-/// 生成存储串 `{salt}${hash}`
+/// 生成存储串。L1：新账号用 argon2id（与系统用户一致的强 KDF）——SHA-256 是高速哈希，
+/// system_settings 泄露后可离线高速爆破。旧的 `{salt}${sha256}` 存储由 verify_password
+/// 兼容校验，无需迁移即可继续登录。
 pub fn store_password(password: &str) -> String {
-    let salt = random_salt();
-    format!("{salt}${}", hash_password(password, &salt))
+    crate::util::password::hash_password(password)
 }
 
-/// 校验存储串 `{salt}${hash}`（格式不符返回 false）
+/// 校验存储串：argon2id PHC（新）优先；否则回退旧 `{salt}${sha256(salt||password)}` 兼容。
 pub fn verify_password(password: &str, stored: &str) -> bool {
+    if crate::util::password::is_argon2id(stored) {
+        return crate::util::password::verify_argon2id(password, stored);
+    }
     match stored.split_once('$') {
         Some((salt, hash)) => {
             !salt.is_empty()

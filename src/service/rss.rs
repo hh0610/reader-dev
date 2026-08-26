@@ -110,9 +110,11 @@ fn parse_feed_by_rule(
 ) -> Vec<RssArticle> {
     let (list_rule, reverse) = crate::service::search::strip_list_rule_prefix(rule_articles);
     let items = crate::service::book::toc_items(&list_rule, xml);
-    let mut vars = crate::parser::rule::RuleVars::new();
     let mut articles: Vec<RssArticle> = Vec::with_capacity(items.len());
     for item in items {
+        // L7：每条目独立 vars（与搜索 analyze_book_list 一致）——此前跨条目共享，
+        // 前一条 @put 的变量会被后一条 @get 读到，字段串条目。
+        let mut vars = crate::parser::rule::RuleVars::new();
         let title = crate::service::search::field_with_vars(
             &item,
             source.rule_title().as_deref(),

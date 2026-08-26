@@ -109,38 +109,54 @@ pub fn parse_explore_entries(explore_url: &str) -> Vec<ExploreEntry> {
             }
             continue;
         }
-        // JSON 数组格式：[{"title":"...","url":"..."}, ...]（inline 或跨行）
+        // JSON 格式：数组 [{"title","url"},...] 或单个对象 {"title","url"}（inline 或跨行）
         if line.starts_with('[') || line.starts_with('{') {
-            // 收集到匹配的 ]（多行 JSON）
+            // 按括号/花括号配平收集跨行 JSON（此前只判 `ends_with(']')`——单个 `{...}`
+            // 对象永不闭合，会把后续所有行吞进来致解析失败、丢弃其后全部分类）。
             let mut json_str = line.to_string();
             let mut j = i + 1;
-            while !json_str.trim_end().ends_with(']') && j < lines.len() {
+            while !json_balanced(&json_str) && j < lines.len() {
                 json_str.push('\n');
                 json_str.push_str(lines[j]);
                 j += 1;
             }
-            i = j;
-            if let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
-                for item in list {
-                    let title = item
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let url = item
-                        .get("url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if !url.is_empty() {
-                        entries.push(ExploreEntry {
-                            title: title.clone(),
-                            url: url.clone(),
-                            r#type: entry_type(&title, &url),
-                        });
+            // 先按数组解析；失败再按单对象解析（包一层成单元素列表）
+            let items: Option<Vec<serde_json::Value>> =
+                serde_json::from_str::<Vec<serde_json::Value>>(&json_str)
+                    .ok()
+                    .or_else(|| {
+                        serde_json::from_str::<serde_json::Value>(&json_str)
+                            .ok()
+                            .filter(|v| v.is_object())
+                            .map(|v| vec![v])
+                    });
+            match items {
+                Some(list) => {
+                    // 解析成功才消费这些行；否则只跳过当前行（i+1），避免吞掉后续分类
+                    i = j;
+                    for item in list {
+                        let title = item
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let url = item
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if !url.is_empty() {
+                            entries.push(ExploreEntry {
+                                title: title.clone(),
+                                url: url.clone(),
+                                r#type: entry_type(&title, &url),
+                            });
+                        }
                     }
                 }
-                continue;
+                None => {
+                    i += 1;
+                }
             }
             continue;
         }
@@ -195,14 +211,49 @@ fn url_title(url: &str) -> String {
     url.to_string()
 }
 
+/// JSON 片段的 `[]`/`{}` 是否配平（引号内与转义字符不计）——用于跨行 JSON 收集的终止判定。
+/// 空/仅空白视为未配平（继续收集）。
+fn json_balanced(s: &str) -> bool {
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut seen = false;
+    for c in s.chars() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '[' | '{' => {
+                depth += 1;
+                seen = true;
+            }
+            ']' | '}' => depth -= 1,
+            _ => {}
+        }
+    }
+    seen && depth <= 0
+}
+
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // 按字节解析 %XX——不对 &str 做切片（`%` 后紧跟多字节 UTF-8 字符时
+        // `&s[i+1..i+3]` 会切进字符内部 panic，如 "100%的书"）。
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
                 i += 3;
                 continue;
             }
@@ -346,11 +397,15 @@ pub async fn explore_url(
             .map(|r| r.is_match(&resp.url))
             .unwrap_or(false);
         if matched {
-            let info =
-                crate::service::book::analyze_book_info(ns, &body, &resp.url, source, &url, None);
+            // M8：用真实响应 URL（resp.url，已拼 base/去 `,{...}` 后缀）作 bookUrl——
+            // 此前用 build_explore_url 的相对结果 `url` → 探索结果 bookUrl 为相对路径/含后缀，
+            // 点进详情 getBookInfo 失败。
+            let info = crate::service::book::analyze_book_info(
+                ns, &body, &resp.url, source, &resp.url, None,
+            );
             if !info.name.is_empty() {
                 return Ok(vec![crate::service::search::single_search_book(
-                    info, source, &url,
+                    info, source, &resp.url,
                 )]);
             }
         }
@@ -496,6 +551,35 @@ pub fn builtin_explore_sources() -> Vec<crate::model::BookSource> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M4 回归：`%` 后紧跟多字节 UTF-8 字符不得 panic（此前 &s[i+1..i+3] 切进字符内部）
+    #[test]
+    fn test_percent_decode_multibyte_no_panic() {
+        assert_eq!(percent_decode("100%的书"), "100%的书");
+        assert_eq!(percent_decode("a%2Fb"), "a/b"); // 正常 %XX 仍解码
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("%中"), "%中");
+    }
+
+    /// M9 回归：单个 JSON 对象行不再吞掉后续分类；括号配平正确终止
+    #[test]
+    fn test_parse_explore_entries_json_object_line() {
+        // 一行 JSON 对象 + 后续普通分类行——对象行不应吞掉后面的「玄幻::/x」
+        let raw = "{\"title\":\"甲\",\"url\":\"/a\"}\n玄幻::/x\n";
+        let entries = parse_explore_entries(raw);
+        let urls: Vec<&str> = entries.iter().map(|e| e.url.as_str()).collect();
+        assert!(urls.contains(&"/a"), "对象条目应解析: {urls:?}");
+        assert!(urls.contains(&"/x"), "后续分类不应被吞掉: {urls:?}");
+    }
+
+    #[test]
+    fn test_json_balanced() {
+        assert!(json_balanced("{\"a\":1}"));
+        assert!(json_balanced("[{\"a\":1}]"));
+        assert!(!json_balanced("{\"a\":1")); // 未闭合
+        assert!(json_balanced("{\"a\":\"}\"}")); // 引号内的 } 不计
+        assert!(!json_balanced("")); // 空视为未配平
+    }
 
     #[test]
     fn test_parse_urls() {

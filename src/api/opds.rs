@@ -323,40 +323,60 @@ fn resolve_local_file_by_format(
 }
 
 /// storage/ 文件书定位（兼容 legacy：{name}.epub/ 目录内含 index.epub 等形态）
+///
+/// 安全：返回前 canonicalize + containment 校验——最终文件必须落在 storage_dir 内
+/// （防 `..` 穿越 / 绝对路径注入 / 符号链接逃逸；与 router::resolve_loc_book_file 同模式）。
+/// 此前缺该校验，可经 saveBook 注入 `storage//etc/passwd` 类 book_url → OPDS 下载任意文件。
 fn resolve_storage_file(storage_dir: &Path, book_url: &str) -> Option<PathBuf> {
     let path = storage_dir.join(book_url.trim_start_matches("storage/"));
+    let mut found: Option<PathBuf> = None;
     if path.is_file() {
-        return Some(path);
+        found = Some(path.clone());
     }
-    if path.is_dir() {
+    if found.is_none() && path.is_dir() {
         let idx = path.join("index.epub");
         if idx.is_file() {
-            return Some(idx);
-        }
-        let rd = std::fs::read_dir(&path).ok()?;
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_file() && p.to_string_lossy().to_lowercase().ends_with(".epub") {
-                return Some(p);
+            found = Some(idx);
+        } else if let Ok(rd) = std::fs::read_dir(&path) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_file() && p.to_string_lossy().to_lowercase().ends_with(".epub") {
+                    found = Some(p);
+                    break;
+                }
             }
         }
     }
-    let parent = path.parent()?;
-    let idx = parent.join("index.epub");
-    if idx.is_file() {
-        return Some(idx);
-    }
-    let rd = std::fs::read_dir(parent).ok()?;
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_file() {
-            let lower = p.to_string_lossy().to_lowercase();
-            if lower.ends_with(".epub") || lower.ends_with(".txt") {
-                return Some(p);
+    if found.is_none() {
+        if let Some(parent) = path.parent() {
+            let idx = parent.join("index.epub");
+            if idx.is_file() {
+                found = Some(idx);
+            } else if let Ok(rd) = std::fs::read_dir(parent) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_file() {
+                        let lower = p.to_string_lossy().to_lowercase();
+                        if lower.ends_with(".epub") || lower.ends_with(".txt") {
+                            found = Some(p);
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
-    None
+    // P0-7 容器校验：canonicalize 后必须仍在 storage 根内
+    let p = found?;
+    let abs = p.canonicalize().unwrap_or_else(|_| p.clone());
+    let root = storage_dir
+        .canonicalize()
+        .unwrap_or_else(|_| storage_dir.to_path_buf());
+    if abs.starts_with(&root) && abs.is_file() {
+        Some(abs)
+    } else {
+        None
+    }
 }
 
 /// 本地文件解析（按扩展名分派：EPUB/TXT/MOBI/AZW3/PDF/FB2/DOCX——不联网）

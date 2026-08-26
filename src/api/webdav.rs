@@ -140,9 +140,13 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // 按字节解析 %XX——不对 &str 做切片（`%` 后紧跟多字节 UTF-8 字符时
+        // `&s[i+1..i+3]` 会切进字符内部 panic，如 `PROPFIND /reader3/webdav/%中`——未认证 DoS）。
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
                 i += 3;
                 continue;
             }
@@ -420,6 +424,15 @@ fn lock(headers: &HeaderMap) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M4 回归：percent_decode 对 `%` 后接多字节 UTF-8 不 panic（`PROPFIND /webdav/%中`）
+    #[test]
+    fn test_percent_decode_multibyte_no_panic() {
+        assert_eq!(percent_decode("%中"), "%中");
+        assert_eq!(percent_decode("a%2Fb"), "a/b");
+        assert_eq!(percent_decode("100%的"), "100%的");
+        assert_eq!(percent_decode("%"), "%");
+    }
 
     /// P0-6：resolve_path 组件级归一化——正常放行、`..` 越出根拒绝（含百分号编码绕过）
     #[test]

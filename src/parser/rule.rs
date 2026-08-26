@@ -523,10 +523,22 @@ pub fn resolve_get(rule: &str, vars: &RuleVars) -> String {
         };
         let start = base + rel;
         let after = start + 5;
-        let Some(end_rel) = rule[after..].find('}') else {
-            break;
+        // 畸形容错（绝不 panic，参考 split_put 对 @put 的宽松处理）：
+        // `@get:` 后须紧跟 `{`——否则原样输出该段并从其后继续扫描
+        // （`@get:}`、`@get:中}`、`@get:` 后无 `{` 均落此分支，按原样文本保留）
+        if !rule[after..].starts_with('{') {
+            out.push_str(&rule[base..after]);
+            base = after;
+            continue;
+        }
+        // 从 `{` 起找配对 `}`（matching_brace 跳过引号/嵌套且按字节安全推进，
+        // 多字节键如 `@get:{中}` 不会切进字符中间）；缺失配对 → 原样保留并继续
+        let Some(close) = matching_brace(rule, after) else {
+            out.push_str(&rule[base..after]);
+            base = after;
+            continue;
         };
-        let key = rule[after + 1..after + end_rel].trim();
+        let key = rule[after + 1..close].trim();
         out.push_str(&rule[base..start]);
         out.push_str(match vars.get(key) {
             Some(v) => v.as_str(),
@@ -537,7 +549,7 @@ pub fn resolve_get(rule: &str, vars: &RuleVars) -> String {
                 _ => "",
             },
         });
-        base = after + end_rel + 1;
+        base = close + 1;
     }
     out.push_str(&rule[base..]);
     out
@@ -586,8 +598,11 @@ pub fn parse_rule(rule: &str) -> Rule {
     if parts.len() > 1 {
         let tail = parts[1].trim();
         if tail.starts_with('@') {
-            // legacy 前缀格式：规则##@前缀（拼接在结果前）
-            prefix = Some(parts[1..].join("##"));
+            // legacy 前缀格式：规则##@前缀（拼接在结果前）。
+            // `@` 仅为「前缀分支」判别标记（区别于 ## 替换正则段），不是前缀值本身——
+            // 存储前剥除，否则拼接结果会带前导 @（如 @https://a.com/toc 这类坏 URL）。
+            let joined = parts[1..].join("##");
+            prefix = Some(joined.strip_prefix('@').unwrap_or(&joined).to_string());
         } else {
             replace_regex = Some(tail.to_string());
             if parts.len() > 2 {
@@ -619,31 +634,64 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-/// 在 `start..` 内寻找花括号（`{{...}}`）之外的 `<js>` / `@js:` 标记
-/// （大小写不敏感，同 find_ci 语义；P3-A：{{}} 内嵌模板中的标记是规则引用而非 JS 段）
+/// 在 `start..` 内寻找花括号（`{{...}}`）、引号、`[]`/`()` 平衡组之外的 `<js>` / `@js:`
+/// 标记（大小写不敏感，同 find_ci 语义）。
+/// - P3-A：{{}} 内嵌模板中的标记是规则引用而非 JS 段
+/// - 引号/[]/() 保护（镜像 css_chain::split_at_chain）：CSS 属性选择器内字面量
+///   （如 `a[data-x='@js:foo']@text`）里的标记不是 JS 段，避免误路由到 JS 引擎变空
 fn find_js_markers(rule: &str, start: usize) -> (Option<usize>, Option<usize>) {
     let b = rule.as_bytes();
     let mut i = start;
-    let mut depth = 0i32;
+    let mut brace_depth = 0i32; // {{ }} 内嵌模板深度
+    let mut group_depth = 0i32; // [] () 平衡组深度
+    let mut in_s = false;
+    let mut in_d = false;
     let mut js_tag = None;
     let mut js_at = None;
     while i < rule.len() {
-        // 只处理字符边界（{{/}}/@js:/<js> 均为 ASCII；多字节字符逐字跳过）
+        // 只处理字符边界（{{/}}/@js:/<js> 及引号/括号均为 ASCII；多字节字符逐字跳过）
         if !rule.is_char_boundary(i) {
             i += 1;
             continue;
         }
-        if b[i] == b'{' && i + 1 < rule.len() && b[i + 1] == b'{' {
-            depth += 1;
+        let c = b[i];
+        // 引号切换（镜像 split_at_chain：'/" 内的标记不参与识别）
+        if c == b'\'' && !in_d {
+            in_s = !in_s;
+            i += 1;
+            continue;
+        }
+        if c == b'"' && !in_s {
+            in_d = !in_d;
+            i += 1;
+            continue;
+        }
+        if in_s || in_d {
+            i += rule[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            continue;
+        }
+        if c == b'{' && i + 1 < rule.len() && b[i + 1] == b'{' {
+            brace_depth += 1;
             i += 2;
             continue;
         }
-        if b[i] == b'}' && i + 1 < rule.len() && b[i + 1] == b'}' && depth > 0 {
-            depth -= 1;
+        if c == b'}' && i + 1 < rule.len() && b[i + 1] == b'}' && brace_depth > 0 {
+            brace_depth -= 1;
             i += 2;
             continue;
         }
-        if depth == 0 {
+        // [] () 平衡组（属性选择器 / 正则分组内的 @js:/<js> 是字面量而非 JS 段）
+        if c == b'[' || c == b'(' {
+            group_depth += 1;
+            i += 1;
+            continue;
+        }
+        if c == b']' || c == b')' {
+            group_depth = (group_depth - 1).max(0);
+            i += 1;
+            continue;
+        }
+        if brace_depth == 0 && group_depth == 0 {
             if js_at.is_none()
                 && rule[i..]
                     .get(..4)
@@ -886,7 +934,8 @@ fn apply_rule_inner(
             // 重建完整规则串（保留 ##前缀/##替换段）后重新解析
             let mut full = expanded.clone();
             if let Some(p) = &rule.prefix {
-                full.push_str("##");
+                // 重建时补回 `@` 分支标记（prefix 存储时已剥除），确保重新解析仍走前缀分支
+                full.push_str("##@");
                 full.push_str(p);
             } else if let Some(re) = &rule.replace_regex {
                 full.push_str("##");
@@ -2002,9 +2051,12 @@ pub struct JsSeg<'a> {
     pub text: &'a str,
 }
 
-/// 是否含 JS 标记（<js> 或 @js:，大小写不敏感——对齐 legado JS_PATTERN）
+/// 是否含 JS 标记（<js> 或 @js:，大小写不敏感——对齐 legado JS_PATTERN）。
+/// 复用 find_js_markers 的扫描：跳过引号与 `[]`/`()`/`{{}}` 内的标记——CSS 属性
+/// 选择器里的字面 `@js:`/`<js>`（如 `a[data-x='@js:foo']@text`）不算 JS 段。
 pub fn contains_js_marker(rule: &str) -> bool {
-    find_ci(rule, "<js>").is_some() || find_ci(rule, "@js:").is_some()
+    let (tag, at) = find_js_markers(rule, 0);
+    tag.is_some() || at.is_some()
 }
 
 fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
@@ -2151,18 +2203,75 @@ pub fn split_combined(rule: &str) -> (Option<&'static str>, Vec<&str>) {
     }
     match sep_pos {
         None => (None, vec![rule]),
-        Some(pos) => {
-            let mut subs = vec![&rule[..pos]];
-            let rest = &rule[pos + sep_kind.len()..];
-            let mut start = 0;
-            while let Some(p) = rest[start..].find(sep_kind) {
-                subs.push(&rest[start..start + p]);
-                start += p + sep_kind.len();
-            }
-            subs.push(&rest[start..]);
-            (Some(sep_kind), subs)
-        }
+        // 二次及后续切分同样走平衡扫描（原实现裸 find 忽略括号平衡，会误切
+        // 子规则内 []/()/{}/引号里的分隔符，如 `$.a||$.list[?(@.a||@.b)].name`）
+        Some(_) => (Some(sep_kind), split_combined_all(rule, sep_kind)),
     }
+}
+
+/// 按 `sep` 顶层平衡切分（跟踪 [] () {} 深度 + 引号 + 转义，仅在深度 0、引号外切分）——
+/// 与 split_combined 首分隔符识别同一套扫描，确保每一次切分都保持括号平衡。
+fn split_combined_all<'a>(rule: &'a str, sep: &'static str) -> Vec<&'a str> {
+    let b = rule.as_bytes();
+    let sb = sep.as_bytes();
+    let mut depth_sq = 0i32;
+    let mut depth_par = 0i32;
+    let mut depth_cur = 0i32;
+    let mut in_s = false;
+    let mut in_d = false;
+    let mut esc = false;
+    let mut subs: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if esc {
+            esc = false;
+            i += 1;
+            continue;
+        }
+        if c == b'\\' {
+            esc = true;
+            i += 1;
+            continue;
+        }
+        if c == b'\'' && !in_d {
+            in_s = !in_s;
+            i += 1;
+            continue;
+        }
+        if c == b'"' && !in_s {
+            in_d = !in_d;
+            i += 1;
+            continue;
+        }
+        if in_s || in_d {
+            i += 1;
+            continue;
+        }
+        match c {
+            b'[' => depth_sq += 1,
+            b']' => depth_sq -= 1,
+            b'(' => depth_par += 1,
+            b')' => depth_par -= 1,
+            b'{' => depth_cur += 1,
+            b'}' => depth_cur -= 1,
+            _ if depth_sq == 0
+                && depth_par == 0
+                && depth_cur == 0
+                && b[i..].starts_with(sb) =>
+            {
+                subs.push(&rule[start..i]);
+                i += sb.len();
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    subs.push(&rule[start..]);
+    subs
 }
 
 /// 应用前缀与替换（legado 语义：前缀拼接 + 正则替换/替换首个）
@@ -2187,7 +2296,8 @@ fn apply_post(results: Vec<String>, rule: &Rule) -> Vec<String> {
 }
 
 /// 替换执行（对齐 legado replaceRegex）：
-/// - replaceFirst（###）：仅替换首个匹配；无匹配 → 空串；正则编译失败 → 替换串本身
+/// - replaceFirst（###）：仅替换首个匹配；无匹配 → 空串；正则编译失败 → 首个字面替换
+///   （与非 first 分支的字面回退一致；模式不存在时即保留原文，绝不泄漏替换模板字面量）
 /// - 普通：全部替换；正则编译失败 → 字面串替换
 fn replace_regex_str(result: &str, re_str: &str, replacement: &str, first: bool) -> String {
     if first {
@@ -2199,7 +2309,9 @@ fn replace_regex_str(result: &str, re_str: &str, replacement: &str, first: bool)
                     String::new()
                 }
             }
-            Err(_) => replacement.to_string(),
+            // 编译失败：退化为「首个字面替换」（与非 first 分支一致）——re_str 作普通
+            // 子串处理，模式不在原文中即返回原文，不再返回替换模板 `replacement` 本身
+            Err(_) => result.replacen(re_str, replacement, 1),
         }
     } else {
         match crate::util::regex::Regex::new(re_str) {
@@ -2215,11 +2327,21 @@ mod tests {
 
     #[test]
     fn test_parse_prefix() {
-        // ## 第二段 @ 开头 → 前缀（兼容 legacy 旧格式）
+        // ## 第二段 @ 开头 → 前缀（兼容 legacy 旧格式）；@ 为分支标记，存储时剥除
         let r = parse_rule("div.book##@https://a.com");
         assert_eq!(r.kind, RuleKind::Css);
-        assert_eq!(r.prefix.as_deref(), Some("@https://a.com"));
+        assert_eq!(r.prefix.as_deref(), Some("https://a.com"));
         assert!(r.replace_regex.is_none());
+    }
+
+    /// ##@ 前缀：`@` 仅为分支标记，剥除后拼接才是合法 URL（不带前导 @）
+    #[test]
+    fn test_prefix_strips_at_marker() {
+        let r = parse_rule("a@href##@https://a.com");
+        assert_eq!(r.prefix.as_deref(), Some("https://a.com"));
+        // 拼接结果不应带前导 @
+        let out = apply_post(vec!["/toc".to_string()], &r);
+        assert_eq!(out, vec!["https://a.com/toc".to_string()]);
     }
 
     #[test]
@@ -2784,6 +2906,68 @@ mod tests {
         let (sep, subs) = split_combined("{{a&&b}}&&c");
         assert_eq!(sep, Some("&&"));
         assert_eq!(subs, vec!["{{a&&b}}", "c"]);
+    }
+
+    /// 二次切分保持括号平衡：子规则 []/() 内的分隔符不被误切（原裸 find 会切碎）
+    #[test]
+    fn test_split_combined_balanced_second_split() {
+        let (sep, subs) = split_combined("$.a||$.list[?(@.a||@.b)].name");
+        assert_eq!(sep, Some("||"));
+        assert_eq!(subs, vec!["$.a", "$.list[?(@.a||@.b)].name"]);
+        // 三段：中段带平衡组内的分隔符，仍只在顶层切分
+        let (sep2, subs2) = split_combined("a&&b[x&&y]&&c");
+        assert_eq!(sep2, Some("&&"));
+        assert_eq!(subs2, vec!["a", "b[x&&y]", "c"]);
+        // 引号内分隔符受保护（二次及以后切分）
+        let (sep3, subs3) = split_combined("a||b['x||y']||c");
+        assert_eq!(sep3, Some("||"));
+        assert_eq!(subs3, vec!["a", "b['x||y']", "c"]);
+    }
+
+    /// F12/AR4：@get 畸形输入容错——绝不 panic，畸形段按原样文本保留
+    #[test]
+    fn test_resolve_get_malformed_no_panic() {
+        let mut vars = RuleVars::new();
+        vars.insert("中".to_string(), "中文变量".to_string());
+        // `@get:}`：@get: 后非 `{` → 原样输出
+        assert_eq!(resolve_get("@get:}", &vars), "@get:}");
+        // `@get:中}`：@get: 后非 `{`（多字节）→ 原样输出，不切进字符中间
+        assert_eq!(resolve_get("@get:中}", &vars), "@get:中}");
+        // `@get:{中}`：多字节键正常取值
+        assert_eq!(resolve_get("@get:{中}", &vars), "中文变量");
+        // `@get:` 后无 `{`（无 `}`）→ 原样保留
+        assert_eq!(resolve_get("@get:", &vars), "@get:");
+        assert_eq!(resolve_get("prefix@get:abc", &vars), "prefix@get:abc");
+        // 畸形段之后的合法 @get 仍被解析（畸形不阻断后续）
+        assert_eq!(resolve_get("@get:}@get:{中}", &vars), "@get:}中文变量");
+    }
+
+    /// ### replaceFirst：替换正则非法（未闭合分组）→ 保留原文，不泄漏替换模板
+    #[test]
+    fn test_replace_first_invalid_regex_keeps_original() {
+        // `(第.章` 未闭合分组编译失败——旧实现返回替换模板 `[$1]`，现应保留原标题
+        let out = replace_regex_str("第一章 标题", "(第.章", "[$1]", true);
+        assert_eq!(out, "第一章 标题");
+        // 与非 first 分支的字面回退一致
+        let out2 = replace_regex_str("第一章 标题", "(第.章", "[$1]", false);
+        assert_eq!(out2, "第一章 标题");
+    }
+
+    /// 引号/[]/() 内的字面 @js:/<js> 不被当作 JS 段（镜像 split_at_chain 保护）
+    #[test]
+    fn test_contains_js_marker_ignores_quotes_and_brackets() {
+        // CSS 属性选择器内字面标记 → 非 JS
+        assert!(!contains_js_marker("a[data-x='@js:foo']@text"));
+        assert!(!contains_js_marker(r#"a[data-x="<js>x</js>"]@text"#));
+        // 正则分组内标记 → 非 JS
+        assert!(!contains_js_marker("(@js:foo)"));
+        // 顶层真实标记仍识别
+        assert!(contains_js_marker("a@href@js:1+1"));
+        assert!(contains_js_marker("<js>result</js>"));
+        // css_chain 路由：带引号字面标记应走纯 CSS，命中属性文本
+        let html = r#"<a data-x="@js:foo">链接文本</a>"#;
+        let r = crate::parser::css_chain::css_chain("a[data-x='@js:foo']@text", html);
+        assert_eq!(r, vec!["链接文本".to_string()]);
     }
 
     #[test]

@@ -494,6 +494,19 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
             post(upload_user_file).layer(axum::extract::DefaultBodyLimit::max(upload_limit)),
         )
         .route("/reader3/login", post(login))
+        // 兜底：任一 handler panic（如书源规则/搜索词触发的 slice/char-boundary panic）
+        // 转为 500 JSON 而非直接断连——单请求失败不再拖垮连接或 SSE 流。
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            |_err: Box<dyn std::any::Any + Send + 'static>| {
+                Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("Content-Type", "application/json; charset=utf-8")
+                    .body(Body::from(
+                        r#"{"isSuccess":false,"errorMsg":"服务器内部错误","data":null}"#,
+                    ))
+                    .unwrap()
+            },
+        ))
         .with_state(state)
 }
 
@@ -3199,14 +3212,37 @@ async fn set_book_source(
             )
             .await
             {
-                Ok(chapters) => {
+                Ok(chapters) if !chapters.is_empty() => {
                     if let Ok(json) = serde_json::to_string(&chapters) {
                         let _ = state
                             .storage
                             .cache_toc(&namespace, &new_url, &toc_url_new, &json)
                             .await;
                     }
+                    // M3：换源后按旧章节标题在新目录中重定位进度（legado Book.changeTo）——
+                    // 新旧源卷标题/防盗章差异会致同 index 指向不同章节。仅在精确标题命中
+                    // 且 index 变化时回写 dur_chapter_index（找不到则保留原值，不猜测）。
+                    if let Some(old_title) = book.dur_chapter_title.as_deref() {
+                        if !old_title.is_empty() {
+                            if let Some(pos) = chapters.iter().position(|c| c.title == old_title) {
+                                if pos as i64 != book.dur_chapter_index {
+                                    let patch: serde_json::Map<String, Value> =
+                                        [("durChapterIndex".to_string(), json!(pos as i64))]
+                                            .into_iter()
+                                            .collect();
+                                    let _ = state
+                                        .storage
+                                        .patch_book(&namespace, &new_url, &patch)
+                                        .await;
+                                    book.dur_chapter_index = pos as i64;
+                                }
+                            }
+                        }
+                    }
                 }
+                // 空目录不缓存——否则换源后 5 分钟内 getBookToc 恒命中空缓存、重试无效
+                // （与 getBookToc 的空目录防护一致）
+                Ok(_) => tracing::warn!("setBookSource 新目录预取为空（不缓存）"),
                 Err(e) => tracing::warn!("setBookSource 新目录预取失败（忽略）: {e}"),
             }
             Json(ReturnData::ok(
@@ -3400,7 +3436,16 @@ async fn get_book_info(
                         &shelf.author,
                     );
                 }
-            } else {
+            }
+            // 书名为空 = 详情规则未命中（legado BookInfo.analyzeBookInfo 书名空即抛异常）。
+            // 此前静默返回成功并写 10 分钟进程缓存 → 详情页空白且缓存毒化。
+            // 书架书有兜底书名不受此限；非书架书书名空则报错且不入缓存。
+            // （searchBookSource/SSE 已做同样判空，getBookInfo 此前遗漏。）
+            if info.name.trim().is_empty() {
+                tracing::warn!("getBookInfo 书名为空 [{url}]（书源详情规则可能未命中）");
+                return Json(ReturnData::err("获取详情失败（书源详情规则未命中）"));
+            }
+            if shelf_match.is_none() {
                 // 非书架书：写入进程内详情缓存（下次同 URL 直接复用）
                 book_info_cache_put(&namespace, &url, info.clone());
             }
@@ -3553,16 +3598,33 @@ async fn get_book_toc(
     )
     .await
     {
+        Ok(chapters) if chapters.is_empty() => {
+            // 解析成功但目录为空 = 书源目录规则失效/上游返回验证页（legado TocEmptyException）。
+            // 此前静默返回 isSuccess:true + 空数组 → 前端「未获取到章节目录」无法区分规则错/网络错，
+            // 且日志无 error。改为明确业务错误，并记 lastCheckError。
+            if let Some(shelf) = shelf_for_write.as_ref() {
+                let _ = state
+                    .storage
+                    .patch_book(
+                        &namespace,
+                        &shelf.book_url,
+                        &[("lastCheckError", json!("未解析到章节（书源目录规则可能失效）"))]
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), v.clone()))
+                            .collect(),
+                    )
+                    .await;
+            }
+            tracing::warn!("getBookToc 解析到 0 章 [{toc_url}]（书源目录规则可能失效）");
+            Json(ReturnData::err("未解析到章节（书源目录规则可能失效）"))
+        }
         Ok(chapters) => {
             // F-10：抓取成功后缓存目录（book_url 未知时以 toc_url 为键）。
-            // 空目录不缓存——否则前端「未获取到章节目录→重试」在 TTL 内恒命中空缓存
-            if !chapters.is_empty() {
-                if let Ok(json) = serde_json::to_string(&chapters) {
-                    let _ = state
-                        .storage
-                        .cache_toc(&namespace, &toc_url, &toc_url, &json)
-                        .await;
-                }
+            if let Ok(json) = serde_json::to_string(&chapters) {
+                let _ = state
+                    .storage
+                    .cache_toc(&namespace, &toc_url, &toc_url, &json)
+                    .await;
             }
             // F8：成功回写 latestChapterTitle/totalChapterNum/lastCheckTime，清 lastCheckError
             if let Some(shelf) = shelf_for_write.as_ref() {
@@ -3889,13 +3951,22 @@ async fn get_book_content(
         &namespace,
         &chapter_url,
         &source,
-        5,
+        // 正文分页上限：与目录一致提到 20（此前 5 会静默截断长章节尾部）；
+        // H9 已加翻页环检测，提高上限不会因自引用 next 而死循环。
+        20,
         chapter_title_ctx,
         book_name_ctx,
         &book_url,
     )
     .await
     {
+        Ok(content) if content.trim().is_empty() => {
+            // 正文为空 = 书源正文规则失效/上游返回验证页（漫画分支已判空，文本分支此前未判）。
+            // 此前静默返回 isSuccess:true + 空正文 → 用户看到全白页且顺带把进度推进到空章节。
+            // 改为明确业务错误，且不写缓存、不存进度。
+            tracing::warn!("getBookContent 正文为空 [{chapter_url}]（书源正文规则可能失效）");
+            Json(ReturnData::err("正文为空（书源正文规则可能失效）"))
+        }
         Ok(content) => {
             // 抓取成功 → 写回正文缓存（仅书源书且带 bookUrl；CACHECHAPTERCONTENT=false 时跳过）
             if !book_url.is_empty()
@@ -6717,11 +6788,15 @@ async fn backup_to_mongodb(
     headers: HeaderMap,
     body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
-    // 认证解析保持不变（secure 模式校验 accessToken；非 secure 放行）
-    if let Err(ret) = resolve_namespace(&state, &params, &headers).await {
-        return Json(ret);
-    }
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    // 安全：跨命名空间备份（含 users 表密码哈希/token）+ 任意 uri 外连是特权操作——
+    // secure 模式必须管理员/secureKey 校验（此前仅校验"已登录"并信任客户端 ns，任一注册
+    // 用户可导出全部租户凭据；restore 侧可注入 admin 提权）。非 secure 单用户无跨租户边界，放行。
+    if state.storage.config.secure {
+        if let Err(ret) = check_manager_auth(&state, &params, &headers, body_json.as_ref()).await {
+            return Json(ret);
+        }
+    }
     let namespace = mongo_backup_ns(&params, body_json.as_ref());
     let (uri, db) = match mongo_backup_params(&params, body_json.as_ref()) {
         Ok(v) => v,
@@ -6752,11 +6827,14 @@ async fn restore_from_mongodb(
     headers: HeaderMap,
     body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
-    // 认证解析保持不变（secure 模式校验 accessToken；非 secure 放行）
-    if let Err(ret) = resolve_namespace(&state, &params, &headers).await {
-        return Json(ret);
-    }
     let body_json = body.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    // 安全：跨命名空间恢复可覆盖任意用户数据、并从任意 uri 注入 is_admin 用户提权——
+    // secure 模式必须管理员/secureKey 校验（详见 backup_to_mongodb 注释）；非 secure 放行。
+    if state.storage.config.secure {
+        if let Err(ret) = check_manager_auth(&state, &params, &headers, body_json.as_ref()).await {
+            return Json(ret);
+        }
+    }
     let namespace = mongo_backup_ns(&params, body_json.as_ref());
     let (uri, db) = match mongo_backup_params(&params, body_json.as_ref()) {
         Ok(v) => v,
@@ -6975,7 +7053,8 @@ pub(crate) async fn resolve_current_user(
     }
     match state.storage.find_user(username).await {
         Ok(Some(user)) => {
-            let token_ok = (!user.token.is_empty() && user.token == token)
+            let token_ok = (!user.token.is_empty()
+                && crate::util::constant_time::ct_eq(&user.token, token))
                 || crate::model::user::token_map_valid(&user.token_map, token, now_millis());
             if !token_ok {
                 return Err(login_required());
@@ -7718,6 +7797,12 @@ async fn save_book(
     if book_url.is_empty() {
         // legacy saveBookToShelf 文案
         return Json(ReturnData::err("书籍链接不能为空"));
+    }
+    // 安全：拒绝会穿越出 storage 根的本地书链接（纵深防御——OPDS/本地文件定位虽已做
+    // containment 校验，但此处直接挡住入库，避免 `storage//etc/passwd`、`storage/../..`
+    // 之类链接进书架）。http(s)://、local:// 等非本地文件链接不受影响。
+    if is_traversal_book_url(&book_url) {
+        return Json(ReturnData::err("非法的书籍链接"));
     }
 
     // 判重：先按 URL，再按 书名+作者（legacy 判重键——同书不同 URL 视为同一本，
@@ -9924,10 +10009,16 @@ async fn import_default_txt_toc_rules(
 /// online/bookSource（与 getServerStats 相同聚合）。
 async fn get_system_info(
     State(state): State<AppState>,
-    Query(_params): Query<HashMap<String, String>>,
+    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Json<ReturnData> {
-    let _ = headers;
+    // 安全：聚合运维信息（用户数/内存/端口/在线会话数）——secure 模式要求登录，
+    // 避免匿名侦察（此前完全未鉴权）。
+    if state.storage.config.secure {
+        if let Err(ret) = resolve_current_user(&state, &params, &headers).await {
+            return Json(ret);
+        }
+    }
     let user_count = state.storage.count_users().await.unwrap_or(0);
     let book_count = state.storage.count_books().await.unwrap_or(0);
     let source_count = state.storage.count_all_book_sources().await.unwrap_or(0);
@@ -9951,7 +10042,17 @@ async fn get_system_info(
 /// 内存（总量/可用/已用/进程，MB + 百分比）、CPU（短采样 ~200ms）、请求计数
 /// （总数/今日/按接口 Top10）、在线会话（有效 token 数）、书源成功率（最近一次检测
 /// 结果，未检测则 successRate=null + 说明）、uptime。
-async fn get_server_stats(State(state): State<AppState>) -> Json<ReturnData> {
+async fn get_server_stats(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Json<ReturnData> {
+    // 安全：secure 模式要求登录（同 getSystemInfo，避免匿名侦察在线会话数/内存/端口）。
+    if state.storage.config.secure {
+        if let Err(ret) = resolve_current_user(&state, &params, &headers).await {
+            return Json(ret);
+        }
+    }
     let agg = crate::service::monitor::collect(&state.storage).await;
     let mut data = agg.to_json();
     data["version"] = json!(env!("CARGO_PKG_VERSION"));
@@ -10447,6 +10548,23 @@ fn is_loc_book_file_chapter(chapter_url: &str) -> bool {
     crate::service::local_book::SUPPORTED_EXTENSIONS
         .iter()
         .any(|e| lower.ends_with(&format!(".{e}")))
+}
+
+/// 本地书链接穿越检测：`storage/`-型 book_url 去前缀后若为绝对路径或含 `..` 段 → 拒绝。
+/// （http(s)://、local://、无 `storage/` 前缀的普通相对文件名不判为穿越。）
+fn is_traversal_book_url(book_url: &str) -> bool {
+    let rest = match book_url.strip_prefix("storage/") {
+        Some(r) => r,
+        None => return false,
+    };
+    // 绝对路径（trim 后 join 会整体覆盖到根）、Windows 盘符、`..` 路径段
+    if rest.starts_with('/') || rest.starts_with('\\') {
+        return true;
+    }
+    if rest.len() >= 2 && rest.as_bytes()[1] == b':' {
+        return true; // C:\ 之类
+    }
+    rest.split(['/', '\\']).any(|seg| seg == "..")
 }
 
 /// legacy 本地书文件定位：book_url 指向的文件可能缺失（legacy 导入时改名 index.epub）
@@ -11021,12 +11139,19 @@ fn webdav_status_404() -> Response {
 async fn serve_data_file(
     state: &AppState,
     headers: &HeaderMap,
+    params: &HashMap<String, String>,
     prefix: &str,
     uri_path: &str,
 ) -> Response {
     let Some(rel) = uri_path.strip_prefix(prefix).and_then(safe_data_rel_path) else {
         return webdav_status_404();
     };
+    // 安全：storage/data 按命名空间分目录（rel 首段=namespace）。secure 模式下这些
+    // 书籍资源/章节 HTML 曾无鉴权 → 匿名可 `GET /epub/<别人>/...` 跨租户读正文。
+    // 现要求 token 命名空间与 URL 首段一致（管理员例外）；无 token/不匹配 → 404。
+    if !data_file_namespace_ok(state, params, headers, &rel).await {
+        return webdav_status_404();
+    }
     let root = state.storage.config.storage_dir().join("data");
     let file = root.join(&rel);
     // 防穿越兜底：规范化后必须仍位于 data 根内（符号链接/盘符等），且必须是普通文件
@@ -11061,13 +11186,51 @@ async fn serve_data_file(
         .unwrap()
 }
 
+/// secure 模式下 storage/data 资源的命名空间校验：rel 首段（namespace）必须等于 token
+/// 对应用户；管理员放行；非 secure 模式放行（单用户无跨租户边界）。
+async fn data_file_namespace_ok(
+    state: &AppState,
+    params: &HashMap<String, String>,
+    headers: &HeaderMap,
+    rel: &std::path::Path,
+) -> bool {
+    if !state.storage.config.secure {
+        return true;
+    }
+    let user = match resolve_current_user(state, params, headers).await {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    if user.is_admin {
+        return true;
+    }
+    let first = rel
+        .components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
+        .unwrap_or_default();
+    first == user.username
+}
+
+/// URI query → 参数表（accessToken 等；供无 Query 提取器的裸 Uri 处理函数复用）
+fn query_params(uri: &axum::http::Uri) -> HashMap<String, String> {
+    uri.query()
+        .map(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// GET /book-assets/*rest：storage/data/** 书籍资源（legacy YueduApi.kt:136-146）
 async fn book_assets(
     State(state): State<AppState>,
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
-    serve_data_file(&state, &headers, "/book-assets/", uri.path()).await
+    let params = query_params(&uri);
+    serve_data_file(&state, &headers, &params, "/book-assets/", uri.path()).await
 }
 
 /// GET /epub/*rest：storage/data/** EPUB 章节 HTML（含 JS 注入，legacy YueduApi.kt:147-162）
@@ -11076,7 +11239,8 @@ async fn epub_asset(
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
-    serve_data_file(&state, &headers, "/epub/", uri.path()).await
+    let params = query_params(&uri);
+    serve_data_file(&state, &headers, &params, "/epub/", uri.path()).await
 }
 
 /// 逐段解码并校验相对路径（防穿越）：拒绝 ..、段内分隔符残留（%2F/%5C 解码后再查）、
@@ -13727,7 +13891,12 @@ mod tests {
         // 模拟最近一次书源检测
         crate::service::monitor::record_book_source_check("default", 10, 3);
 
-        let ret = get_server_stats(AxumState(state.clone())).await;
+        let ret = get_server_stats(
+            AxumState(state.clone()),
+            Query(HashMap::new()),
+            HeaderMap::new(),
+        )
+        .await;
         assert!(ret.0.is_success, "{} {}", ret.0.error_msg, ret.0.data);
         let d = &ret.0.data;
         // 版本/端口

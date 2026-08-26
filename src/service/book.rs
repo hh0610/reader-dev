@@ -566,6 +566,10 @@ async fn analyze_toc_impl(
     let mut all: Vec<BookChapter> = Vec::new();
     let mut current_url = toc_url.to_string();
     let mut reverse = false;
+    // H9：翻页 URL 去重/环检测（legado nextUrlList）——站点最后一页把「下一页」指向
+    // 当前页/首页时，此前只判 next.is_empty() 会把同页抓满 max_pages 次（慢+可能被封 IP）。
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(current_url.clone());
     // legado Book.putVariable：详情（getBookInfo）写入的变量在目录/正文流程共享
     // P1 双键合并：book_url 级作底、toc_url 级覆盖
     let mut vars =
@@ -612,13 +616,15 @@ async fn analyze_toc_impl(
         }
         all.extend(chapters);
 
-        // 多页目录
+        // 多页目录：nextTocUrl 在 init/preUpdateJs 处理后的文档（page_html）上求值——
+        // 此前用原始 page_body，对 `init` 相对提取（JSON/加密源）的 next 规则恒不命中 →
+        // 多页目录静默只取第一页。
         let next = rule
             .next_toc_url
             .as_deref()
             .map(|r| {
                 crate::service::search::field_url_with_vars(
-                    &page_body,
+                    &page_html,
                     Some(r),
                     "",
                     &base,
@@ -631,7 +637,12 @@ async fn analyze_toc_impl(
         }
         // E7：翻页 URL 过模板/JS 管线后再绝对化
         let next = expand_next_url(&next, &base, source, ns);
-        current_url = to_abs(&next, &base);
+        let next_abs = to_abs(&next, &base);
+        // H9：已访问过的 next（指回自身/首页/环）→ 停止翻页
+        if !visited.insert(next_abs.clone()) {
+            break;
+        }
+        current_url = next_abs;
         crate::parser::rule::save_book_vars(ns, &source.book_source_url, &current_url, &vars);
     }
 
@@ -987,8 +998,11 @@ pub async fn analyze_media_url(
         chapter_url,
         &vars,
     );
+    // M7：此处 content 规则确实存在（上面已对"无规则/空规则"直接回退 chapter_url）——
+    // 若规则未命中任何 URL 则报错，而非回退章节页 URL（否则播放器会去加载 HTML 页面
+    // 当 mp3/mp4/下载文件，用户看到"播放失败"而非"书源规则失效"）。
     let Some(mut url) = urls.into_iter().next() else {
-        return Ok(chapter_url.to_string());
+        anyhow::bail!("媒体地址提取为空（书源正文规则可能失效）");
     };
     url = to_abs(&url, &base);
     Ok(url)
@@ -1126,6 +1140,10 @@ async fn analyze_content_impl(
 ) -> Result<String> {
     let mut parts: Vec<String> = Vec::new();
     let mut current_url = chapter_url.to_string();
+    // H9：翻页 URL 去重/环检测——站点最后一页把 nextContentUrl 指向自身/本章首页时，
+    // 此前只判 next.is_empty() 会把同一页正文重复拼接 max_pages 次（用户看到重复正文）。
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(current_url.clone());
     // 详情/目录流程的 @put 变量按章节 URL 共享（analyze_toc 已逐章落盘）
     // P1 双键合并：book_url 级作底、章节级覆盖——直接取正文时详情阶段变量仍可见
     let mut vars = crate::parser::rule::load_book_vars_merged(
@@ -1172,7 +1190,12 @@ async fn analyze_content_impl(
         }
         // E7：翻页 URL 过模板/JS 管线后再绝对化
         let next = expand_next_url(&next, &base, source, ns);
-        current_url = to_abs(&next, &base);
+        let next_abs = to_abs(&next, &base);
+        // H9：已访问过的 next（指回自身/首页/环）→ 停止翻页（避免正文重复拼接）
+        if !visited.insert(next_abs.clone()) {
+            break;
+        }
+        current_url = next_abs;
         crate::parser::rule::save_book_vars(ns, &source.book_source_url, &current_url, &vars);
     }
 
@@ -1245,6 +1268,11 @@ pub fn analyze_content_from_with_vars(
             if seg.is_empty() {
                 continue;
             }
+            // legado `##正则` 前缀（前导 ##）= 删除型正则（匹配内容整段移除）。
+            // 剥离前导 `##` 后再切分——否则 splitn 得 pat=""（空正则匹配每个字符间隙）、
+            // rep=正则文本，会把规则文本逐字插进正文（真实书源 replaceRegex 常见此写法，
+            // 如"##[（(]本章未完.*[）)]"用于删章末提示，此前会污染整章正文）。
+            let seg = seg.strip_prefix("##").unwrap_or(seg);
             let mut parts = seg.splitn(3, "##");
             let Some(pat) = parts.next() else { continue };
             let Some(rep) = parts.next() else {
@@ -2053,6 +2081,24 @@ mod tests {
         let html = r#"<div class="content">多   个  空格</div>"#;
         let content = analyze_content_from(html, &src);
         assert_eq!(content, "多个空格");
+    }
+
+    /// 回归：replaceRegex 以 `##` 前缀开头（`##正则`=删除型）——此前 splitn 得 pat=""
+    /// （空正则匹配每个字符间隙）、rep=正则文本，把规则文本逐字插进正文致整章乱码。
+    /// 真实书源（阅友小说）用 `##[（(]本章未完.*[）)]|...` 删章末提示。
+    #[test]
+    fn test_analyze_content_replace_leading_hashhash() {
+        let mut src = test_source();
+        src.rule_content = Some(serde_json::json!({
+            "content": "div.content@text",
+            "replaceRegex": "##[\\(（]本章未完.*[）\\)]|[\\(（]本章完[）\\)]"
+        }));
+        let html = r#"<div class="content">正文一段（本章未完，请点击下一页）</div>"#;
+        let content = analyze_content_from(html, &src);
+        // 关键：规则文本不得逐字插进正文（旧 bug 会得到 75k 字符的乱码）
+        assert!(!content.contains("本章未完"), "章末提示应被删除: {content}");
+        assert!(!content.contains("\\("), "正则文本不得泄漏进正文: {content}");
+        assert_eq!(content, "正文一段", "前导 ## 作删除型正则,删标记留净正文");
     }
 
     /// E9：replaceRegex 多段链（&&）+ ### 尾标仅首次替换 + 无 ## 段删除语义

@@ -10,7 +10,7 @@ license = "GPL-3.0"
 axum = { version = "0.7", features = ["macros", "json", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 rust-embed = { version = "8", features = ["debug-embed"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "fs", "compression-gzip"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "fs", "compression-gzip", "catch-panic"] }
 tower = "0.5"            # 中间件（Layer/Service trait——GAP 60 Cache-Control）
 http = "1"
 

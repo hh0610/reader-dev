@@ -57,8 +57,11 @@ pub fn token_map_list(token_map: &Option<serde_json::Value>) -> Vec<String> {
 }
 
 /// token_map 是否包含指定 token（GAP 59：resolve_namespace 任一 token 均可通过）
+/// 常量时间比较（与主 token 校验一致，避免逐字节时序侧信道）。
 pub fn token_map_contains(token_map: &Option<serde_json::Value>, token: &str) -> bool {
-    token_map_list(token_map).iter().any(|t| t == token)
+    token_map_list(token_map)
+        .iter()
+        .any(|t| crate::util::constant_time::ct_eq(t, token))
 }
 
 /// token 是否有效（含过期检查）：对象形态按过期时间戳判定（已过期 → false）；

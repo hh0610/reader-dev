@@ -199,7 +199,7 @@ pub fn http_client_builder(
     timeout_secs: u64,
     redirect_policy: reqwest::redirect::Policy,
 ) -> Result<reqwest::Client> {
-    build_http_client(timeout_secs, redirect_policy, None)
+    build_http_client(timeout_secs, redirect_policy, None, None)
 }
 
 /// 实际构建：EG5 书源级代理（proxyUrl / URL option 的 proxy 键）显式指定时优先生效，
@@ -209,6 +209,7 @@ fn build_http_client(
     timeout_secs: u64,
     redirect_policy: reqwest::redirect::Policy,
     proxy: Option<&str>,
+    resolve: Option<(&str, &[std::net::SocketAddr])>,
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .redirect(redirect_policy)
@@ -217,12 +218,30 @@ fn build_http_client(
     if timeout_secs > 0 {
         builder = builder.timeout(Duration::from_secs(timeout_secs));
     }
+    // P1 DNS rebinding 防护：把 validate 阶段解析并校验通过的 IP 钉死到本次 URL 的 host
+    // ——否则 reqwest 连接时会重新解析 DNS，校验过的 IP 与实际连接的 IP 可能不一致
+    // （TOCTOU）。字面 IP / 无验证 IP（放行态）时 addrs 为空，跳过映射由 reqwest 自解析。
+    // 注意：仅对直连入口 host 生效；重定向目标的连接由 reqwest 内部发起、无法逐跳钉 IP，
+    // 只能靠 ssrf_redirect_policy 逐跳校验，重定向仍存在 rebinding 残余风险（见该策略注释）。
+    if let Some((host, addrs)) = resolve {
+        if !addrs.is_empty() {
+            builder = builder.resolve_to_addrs(host, addrs);
+        }
+    }
     let explicit_proxy = proxy.map(str::trim).filter(|p| !p.is_empty());
     if let Some(proxy_url) = explicit_proxy {
-        match reqwest::Proxy::all(proxy_url) {
-            Ok(p) => builder = builder.proxy(p),
-            Err(e) => {
-                tracing::warn!("书源级代理配置无效（{proxy_url}）: {e}");
+        // SSRF：书源自带 proxy 属不可信输入——host 解析后拒绝私网/回环，避免被当作
+        // 内网中转跳板（READER_HTTP_PROXY 环境变量是运维可信配置，允许合法指向内网/
+        // localhost 代理，故不在此校验）。校验失败忽略该 proxy 并 warn（不 panic），
+        // 退化为直连而非整体不可用。
+        if !proxy_target_is_public(proxy_url) {
+            tracing::warn!("书源级代理指向内网/回环或无法解析，已忽略（{proxy_url}）");
+        } else {
+            match reqwest::Proxy::all(proxy_url) {
+                Ok(p) => builder = builder.proxy(p),
+                Err(e) => {
+                    tracing::warn!("书源级代理配置无效（{proxy_url}）: {e}");
+                }
             }
         }
     } else if let Ok(proxy_url) = std::env::var("READER_HTTP_PROXY") {
@@ -267,6 +286,12 @@ fn build_http_client(
 /// SSRF 校验重定向策略（fetch 与代理共享 Client 共用；逐跳校验跳转目标防 302 回内网）
 fn ssrf_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
+        // 跳数上限（防重定向环/放大）：超过 10 跳直接判错，不再校验后续目标。
+        // 注：逐跳校验只能拦住"当次解析"到内网的目标——重定向连接由 reqwest 内部
+        // 发起，无法把校验过的 IP 钉死到连接，故重定向仍有 DNS rebinding 残余风险。
+        if attempt.previous().len() >= 10 {
+            return attempt.error(anyhow!("重定向次数过多（超过 10 跳），已中止"));
+        }
         match validate_redirect_target(attempt.url().as_str()) {
             Ok(()) => attempt.follow(),
             Err(e) => attempt.error(e),
@@ -292,7 +317,7 @@ fn proxy_http_client(proxy_url: &str) -> Result<reqwest::Client> {
     {
         return Ok(c.clone()); // Client 内部 Arc，clone 廉价
     }
-    let client = build_http_client(0, ssrf_redirect_policy(), Some(&key))?;
+    let client = build_http_client(0, ssrf_redirect_policy(), Some(&key), None)?;
     let mut m = PROXY_CLIENTS.lock().unwrap_or_else(|e| e.into_inner());
     if m.len() >= PROXY_CLIENT_CACHE_MAX {
         m.clear();
@@ -306,6 +331,23 @@ fn retryable_http_error(e: &anyhow::Error) -> bool {
     // 顶层消息可能是 "error decoding response body"，真正的 EOF/断连在 cause 链里——
     // 用 {:#} 输出完整错误链再匹配，避免漏判导致传输失败不重试。
     let lower = format!("{e:#}").to_ascii_lowercase();
+    // 确定性拒绝（SSRF 私网/回环拦截、URL 非法/缺主机名、data URI base64 解码、
+    // 重定向跳数上限）——输入不变则重试必然同样失败，一律不重试。
+    // 入口 SSRF 校验在 fetch 重试循环外，本判定主要覆盖**重定向**目标被 SSRF 拦截
+    // （发生在 fetch_once 内、经 reqwest redirect 策略返回，错误链含中文拦截文案）。
+    if [
+        "已拦截",           // validate_public_target / validate_redirect_target 私网拦截
+        "无可用地址",       // 域名解析无地址
+        "缺少主机名",       // URL 无 host
+        "url 非法",         // "目标 URL 非法" / "重定向目标 URL 非法"
+        "base64 解码失败",  // data URI 解码
+        "重定向次数过多",   // 跳数上限
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+    {
+        return false;
+    }
     // 证书类错误为确定性失败——重试必然同样失败（真实环境刷屏教训：
     // invalid peer certificate / UnknownIssuer / certificate expired 各重试 2 次纯浪费）
     if [
@@ -345,6 +387,20 @@ fn http_retry_count() -> usize {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(2)
+}
+
+/// 响应体默认大小上限（32 MiB）：reqwest 开了 gzip/brotli/deflate，无上限时
+/// 恶意响应可解压放大成炸弹撑爆内存（OOM）。
+const DEFAULT_HTTP_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// 响应体大小上限（`READER_HTTP_MAX_BYTES` 字节，缺省/非法/0 → 32 MiB）。
+/// [`fetch_once`] 据此做 Content-Length 预检 + 流式累计截断，防解压炸弹 OOM。
+fn http_max_bytes() -> u64 {
+    std::env::var("READER_HTTP_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_HTTP_MAX_BYTES)
 }
 
 // ==================== charset 表单/query 字段编码（legacy AnalyzeUrl.analyzeFields） ====================
@@ -457,15 +513,28 @@ pub async fn fetch(
     charset: Option<&str>,
     proxy: Option<&str>,
 ) -> Result<FetchResponse> {
-    // 入口目标校验（DNS 解析后——拒绝私网/回环/169.254 等）
-    validate_public_target(url).await?;
+    // 入口目标校验（DNS 解析后——拒绝私网/回环/169.254 等），并拿到校验通过的 IP：
+    // 直连时把这些 IP 钉死到连接，避免 reqwest 重新解析 DNS 造成 rebinding（TOCTOU）。
+    let validated_addrs = resolve_public_target(url).await?;
     // EG5：书源级代理 → 共享代理 Client（按代理串缓存）；否则按次构建直连 Client
     let client = match proxy.map(str::trim).filter(|p| !p.is_empty()) {
         Some(p) => {
+            // 代理路径：连接由代理发起，本地 resolve 映射不适用（proxy host 的 SSRF
+            // 校验在 build_http_client 内完成）——保持现状不钉 IP。
             tracing::debug!("http_fetch 走书源级代理 {p} {method} {url}");
             proxy_http_client(p)?
         }
-        None => http_client_builder(timeout_secs, ssrf_redirect_policy())?,
+        None => {
+            // 直连：把入口 host 与校验通过的 IP 钉死到本次 Client（validated_addrs 为空
+            // 即字面 IP/放行态，跳过映射由 reqwest 自解析）。
+            let host = url::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_string()));
+            let resolve = host
+                .as_deref()
+                .map(|h| (h, validated_addrs.as_slice()));
+            build_http_client(timeout_secs, ssrf_redirect_policy(), None, resolve)?
+        }
     };
     let retries = http_retry_count();
     let mut last_err: Option<anyhow::Error> = None;
@@ -527,7 +596,23 @@ async fn fetch_once(
             )
         })
         .collect();
-    let bytes = resp.bytes().await?;
+    // 响应体大小上限（防解压炸弹 OOM——reqwest 开了 gzip/brotli/deflate）：
+    // 先看 Content-Length 预检（超限直接拒绝，避免无谓下载），再流式累计兜底
+    // （服务端不守 Content-Length 或压缩后膨胀时截断报错）。镜像 fetch_image 的做法。
+    use futures::StreamExt;
+    let max_bytes = http_max_bytes();
+    if resp.content_length().is_some_and(|cl| cl > max_bytes) {
+        anyhow::bail!("响应体超过大小上限（{max_bytes} 字节）");
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if (bytes.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
+            anyhow::bail!("响应体超过大小上限（{max_bytes} 字节）");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     // charset 优先级：URL 后缀显式 charset > HTTP Content-Type > HTML meta/自动探测
     let charset = match charset {
         Some(c) => Some(c.to_string()),
@@ -635,6 +720,11 @@ pub static SSRF_ALLOW_PRIVATE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static SSRF_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// 测试互斥锁：串行化会读写进程级 HTTP 相关环境变量（READER_HTTP_MAX_BYTES 等）的测试，
+/// 避免并行测试互相覆盖导致断言抖动。
+#[cfg(test)]
+static HTTP_ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// 测试用 RAII 守卫：持全局互斥锁并将私网放行开关置为 `allow`；Drop 时恢复原值。
 /// 用法：`let _g = ssrf_allow_private_guard(true);`（mock 服务器绑定 127.0.0.1 的测试）；
 /// 拦截断言测试用 `ssrf_allow_private_guard(false)` 持锁确保无并发放行。
@@ -659,28 +749,52 @@ impl Drop for SsrfAllowGuard {
     }
 }
 
-/// 目标 IP 是否为应拦截的私网/回环/链路本地地址：
+/// 目标 IP 是否为应拦截的私网/回环/链路本地/保留地址：
 /// IPv4：127.0.0.0/8（回环）、10/8、172.16/12、192.168/16（私网）、169.254/16（链路本地）、
-/// 0.0.0.0（未指定）、255.255.255.255（广播）；
+/// 0.0.0.0（未指定）、255.255.255.255（广播）、100.64.0.0/10（CGNAT 运营商级 NAT）、
+/// 192.0.0.0/24（IETF 协议分配）、198.18.0.0/15（benchmark）、240.0.0.0/4（保留/Class E）；
 /// IPv6：::1（回环）、fc00::/7（ULA）、fe80::/10（链路本地）、::（未指定）、
-/// IPv4 映射地址（::ffff:a.b.c.d）递归按 IPv4 判定。
+/// IPv4 映射地址（::ffff:a.b.c.d）与 NAT64（64:ff9b::/96）递归提取低 32 位按 IPv4 判定。
 pub fn is_private_target_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                // CGNAT 100.64.0.0/10（RFC 6598 运营商级 NAT 共享地址）
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)
+                // IETF 协议分配 192.0.0.0/24（RFC 6890，含 DS-Lite/端口控制等）
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+                // benchmarking 198.18.0.0/15（RFC 2544）
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)
+                // 保留 / Class E 240.0.0.0/4（RFC 1112，含 255.255.255.255 广播）
+                || (o[0] & 0xf0) == 240
         }
         std::net::IpAddr::V6(v6) => {
+            let seg = v6.segments();
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_unicast_link_local()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
+                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 ULA
                 || v6
                     .to_ipv4_mapped()
                     .is_some_and(|v4| is_private_target_ip(std::net::IpAddr::V4(v4)))
+                // NAT64 64:ff9b::/96（RFC 6052）：低 32 位为内嵌 IPv4，递归判定
+                || (seg[0] == 0x0064
+                    && seg[1] == 0xff9b
+                    && seg[2] == 0
+                    && seg[3] == 0
+                    && seg[4] == 0
+                    && seg[5] == 0
+                    && is_private_target_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                        (seg[6] >> 8) as u8,
+                        (seg[6] & 0xff) as u8,
+                        (seg[7] >> 8) as u8,
+                        (seg[7] & 0xff) as u8,
+                    ))))
         }
     }
 }
@@ -742,23 +856,33 @@ pub fn validate_redirect_target(url: &str) -> Result<()> {
 /// - 解析失败 / 无地址 → 拒绝。
 /// 供 fetch_image 每跳调用（含重定向目标）——/assets/proxy 非 secure 模式同样生效。
 pub async fn validate_public_target(url: &str) -> Result<()> {
+    resolve_public_target(url).await.map(|_| ())
+}
+
+/// 校验并解析回源目标为公网地址，返回校验通过的解析地址集合（供直连时把 IP 钉死到
+/// 连接，防 DNS rebinding：validate 阶段解析校验的 IP 与 reqwest 实际连接的 IP 一致）。
+/// 语义与 [`validate_public_target`] 完全一致，仅多返回解析结果：
+/// - 字面 IP / `SSRF_ALLOW_PRIVATE` 放行态：返回空 `Vec`（调用方无需 resolve 映射）；
+/// - 域名：返回全部解析且校验通过的 [`SocketAddr`](std::net::SocketAddr)。
+pub async fn resolve_public_target(url: &str) -> Result<Vec<std::net::SocketAddr>> {
     if SSRF_ALLOW_PRIVATE.load(Ordering::Relaxed) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let parsed = url::Url::parse(url).map_err(|e| anyhow!("目标 URL 非法: {e}"))?;
-    // 字面 IP 快速路径（不经 DNS——Host::Ipv6 直接判回环，不依赖系统 IPv6 支持）
+    // 字面 IP 快速路径（不经 DNS——Host::Ipv6 直接判回环，不依赖系统 IPv6 支持）；
+    // 字面 IP 无需 resolve 钉死（host 本身即目标 IP，reqwest 不会二次 DNS 解析）。
     match parsed.host() {
         Some(url::Host::Ipv4(ip)) => {
             if is_private_target_ip(std::net::IpAddr::V4(ip)) {
                 anyhow::bail!("目标地址为内网/回环地址（{ip}），已拦截");
             }
-            return Ok(());
+            return Ok(Vec::new());
         }
         Some(url::Host::Ipv6(ip)) => {
             if is_private_target_ip(std::net::IpAddr::V6(ip)) {
                 anyhow::bail!("目标地址为内网/回环地址（{ip}），已拦截");
             }
-            return Ok(());
+            return Ok(Vec::new());
         }
         Some(url::Host::Domain(_)) => {}
         None => anyhow::bail!("目标 URL 缺少主机名"),
@@ -770,23 +894,60 @@ pub async fn validate_public_target(url: &str) -> Result<()> {
         anyhow::bail!("目标地址 localhost 为回环地址，已拦截");
     }
     let port = parsed.port_or_known_default().unwrap_or(80);
-    let mut resolved_any = false;
+    let mut validated: Vec<std::net::SocketAddr> = Vec::new();
     let addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|e| anyhow!("目标域名解析失败（{host}）: {e}"))?;
     for addr in addrs {
-        resolved_any = true;
         if is_private_target_ip(addr.ip()) {
             anyhow::bail!(
                 "目标域名 {host} 解析到内网/回环地址（{}），已拦截",
                 addr.ip()
             );
         }
+        validated.push(addr);
     }
-    if !resolved_any {
+    if validated.is_empty() {
         anyhow::bail!("目标域名 {host} 无可用地址");
     }
-    Ok(())
+    Ok(validated)
+}
+
+/// 校验书源自带 proxy URL 的 host 非私网/回环（SSRF：不可信书源 proxy 亦可作内网跳板）。
+/// [`build_http_client`] 非 async——用 [`std::net::ToSocketAddrs`] 同步解析。
+/// 放行态（测试）直接通过；字面私网 IP / localhost / 解析失败 / 无地址 → 返回 false。
+fn proxy_target_is_public(proxy_url: &str) -> bool {
+    if SSRF_ALLOW_PRIVATE.load(Ordering::Relaxed) {
+        return true;
+    }
+    let parsed = match url::Url::parse(proxy_url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => !is_private_target_ip(std::net::IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => !is_private_target_ip(std::net::IpAddr::V6(ip)),
+        Some(url::Host::Domain(d)) => {
+            if d.eq_ignore_ascii_case("localhost") {
+                return false;
+            }
+            let port = parsed.port_or_known_default().unwrap_or(1080);
+            match std::net::ToSocketAddrs::to_socket_addrs(&(d, port)) {
+                Ok(addrs) => {
+                    let mut any = false;
+                    for addr in addrs {
+                        any = true;
+                        if is_private_target_ip(addr.ip()) {
+                            return false;
+                        }
+                    }
+                    any // 无地址 → 拒绝
+                }
+                Err(_) => false,
+            }
+        }
+        None => false,
+    }
 }
 
 // ==================== 书源 cookie（按用户隔离） ====================
@@ -2597,8 +2758,16 @@ mod tests {
         validate_public_target("https://1.1.1.1/x.png")
             .await
             .expect("公网字面 IP 应放行");
-        // 公网域名：DNS 解析后应为公网地址（example.com 固定公网；离线环境跳过该断言）
-        if tokio::net::lookup_host(("example.com", 443)).await.is_ok() {
+        // 公网域名：DNS 解析后应为公网地址（example.com 固定公网；离线/无 DNS 环境
+        // 2s 超时跳过该断言——避免 getaddrinfo 阻塞拖挂整套件）
+        let net_ok = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::lookup_host(("example.com", 443)),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+        if net_ok {
             validate_public_target("https://example.com/x.png")
                 .await
                 .expect("公网域名解析后应放行");
@@ -2739,8 +2908,19 @@ mod tests {
         }
         validate_redirect_target("https://8.8.8.8/x").expect("公网字面 IP 应放行");
         validate_redirect_target("https://1.1.1.1/x").expect("公网字面 IP 应放行");
-        // 公网域名：DNS 解析后应为公网地址（离线环境跳过）
-        if std::net::ToSocketAddrs::to_socket_addrs(&("example.com", 443)).is_ok() {
+        // 公网域名：DNS 解析后应为公网地址（离线/无 DNS 环境 2s 超时跳过——同步
+        // to_socket_addrs 无超时，放到线程里 recv_timeout 兜底,避免阻塞拖挂整套件）
+        let net_ok = {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let ok =
+                    std::net::ToSocketAddrs::to_socket_addrs(&("example.com", 443)).is_ok();
+                let _ = tx.send(ok);
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap_or(false)
+        };
+        if net_ok {
             validate_redirect_target("https://example.com/x").expect("公网域名解析后应放行");
         }
     }
@@ -3052,5 +3232,362 @@ mod tests {
             .is_err());
         }
         assert_eq!(counter.load(Ordering::SeqCst), 6);
+    }
+
+    // ==================== SSRF 加固回归（DNS 钉死 / 私网段补齐 / 代理校验 / 跳数上限） ====================
+
+    /// 【item 3】私网段补齐：CGNAT 100.64/10、IETF 192.0.0/24、benchmark 198.18/15、
+    /// 保留/Class E 240/4、NAT64 64:ff9b::/96（低 32 位递归判 IPv4）均判私网；
+    /// 邻近公网段（100.63 / 100.128 / 8.8.8.8 / NAT64 内嵌公网 IPv4）不误判。
+    #[test]
+    fn test_is_private_target_ip_additional_ranges() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let priv_v4 = [
+            "100.64.1.1",       // CGNAT 下界内
+            "100.64.0.0",       // CGNAT 边界
+            "100.127.255.255",  // CGNAT 上界
+            "192.0.0.1",        // IETF 协议分配 192.0.0.0/24
+            "192.0.0.255",      // 192.0.0.0/24 上界
+            "198.18.0.1",       // benchmark 198.18.0.0/15
+            "198.19.255.255",   // 198.18.0.0/15 上界
+            "240.0.0.1",        // 保留/Class E 240.0.0.0/4
+            "255.255.255.254",  // Class E 内（255.255.255.255 另由 is_broadcast 覆盖）
+        ];
+        for s in priv_v4 {
+            let ip: Ipv4Addr = s.parse().unwrap();
+            assert!(
+                is_private_target_ip(IpAddr::V4(ip)),
+                "{s} 应判私网/保留"
+            );
+        }
+        // 邻近公网段不误判
+        let pub_v4 = [
+            "100.63.255.255", // CGNAT 下界之外
+            "100.128.0.0",    // CGNAT 上界之外
+            "192.0.1.1",      // 192.0.0.0/24 之外
+            "198.20.0.1",     // 198.18.0.0/15 之外
+            "198.17.255.255", // 198.18.0.0/15 之下
+            "239.255.255.255",// 240/4 之下（组播，但非本函数拦截范围）
+            "8.8.8.8",
+        ];
+        for s in pub_v4 {
+            let ip: Ipv4Addr = s.parse().unwrap();
+            assert!(
+                !is_private_target_ip(IpAddr::V4(ip)),
+                "{s} 不应判私网"
+            );
+        }
+        // NAT64 64:ff9b::/96：低 32 位为 127.0.0.1（回环）→ 私网
+        let nat64_loopback: Ipv6Addr = "64:ff9b::7f00:1".parse().unwrap();
+        assert!(
+            is_private_target_ip(IpAddr::V6(nat64_loopback)),
+            "NAT64 内嵌回环 127.0.0.1 应判私网"
+        );
+        // NAT64 低 32 位为 10.0.0.1（私网）→ 私网
+        let nat64_priv: Ipv6Addr = "64:ff9b::a00:1".parse().unwrap();
+        assert!(is_private_target_ip(IpAddr::V6(nat64_priv)), "NAT64 内嵌 10/8 应判私网");
+        // NAT64 低 32 位为 8.8.8.8（公网）→ 不判私网
+        let nat64_pub: Ipv6Addr = "64:ff9b::808:808".parse().unwrap();
+        assert!(
+            !is_private_target_ip(IpAddr::V6(nat64_pub)),
+            "NAT64 内嵌公网 8.8.8.8 不应判私网"
+        );
+    }
+
+    /// 【item 3】新增私网段经 validate_public_target 字面 IP 路径同样拦截
+    #[tokio::test]
+    async fn test_validate_public_target_new_private_ranges() {
+        let _g = ssrf_allow_private_guard(false);
+        for url in [
+            "http://100.64.1.1/x",
+            "http://198.18.0.1/x",
+            "http://192.0.0.1/x",
+            "http://240.0.0.1/x",
+            "http://[64:ff9b::7f00:1]/x",
+        ] {
+            let err = validate_public_target(url).await.unwrap_err();
+            assert!(
+                err.to_string().contains("已拦截"),
+                "{url} 应被拦截: {err}"
+            );
+        }
+    }
+
+    /// 【item 1】resolve_public_target：字面公网 IP → 空 Vec（无需钉死）；私网 → Err；
+    /// 公网域名 → 非空且全部公网（离线环境跳过域名断言）
+    #[tokio::test]
+    async fn test_resolve_public_target_returns_addrs() {
+        let _g = ssrf_allow_private_guard(false);
+        // 字面公网 IP：校验通过但返回空（host 即 IP，无需 resolve 映射）
+        assert!(
+            resolve_public_target("https://8.8.8.8/x")
+                .await
+                .unwrap()
+                .is_empty(),
+            "字面 IP 应返回空地址集"
+        );
+        // 私网字面 IP：拒绝
+        assert!(resolve_public_target("http://10.0.0.1/x").await.is_err());
+        // 公网域名：返回非空且全部公网（离线/无 DNS 2s 超时跳过）
+        let net_ok = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::net::lookup_host(("example.com", 443)),
+        )
+        .await
+        .map(|r| r.is_ok())
+        .unwrap_or(false);
+        if net_ok {
+            let addrs = resolve_public_target("https://example.com/x")
+                .await
+                .expect("公网域名应解析通过");
+            assert!(!addrs.is_empty(), "公网域名应返回解析地址");
+            assert!(
+                addrs.iter().all(|a| !is_private_target_ip(a.ip())),
+                "解析地址应全部为公网"
+            );
+        }
+    }
+
+    /// 【item 1】DNS 钉死：build_http_client 的 resolve 映射把不可解析域名（.invalid）
+    /// 钉到 mock 服务器 IP——请求能连通即证明连接用的是校验过的 IP（而非重新 DNS 解析）。
+    #[tokio::test]
+    async fn test_build_http_client_pins_resolve_addrs() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = "pinned-ok";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        // .invalid 顶级域保证公网不可解析（RFC 2606）——唯有 resolve 钉死才能连通
+        let pinned = [std::net::SocketAddr::from(([127, 0, 0, 1], addr.port()))];
+        let client = build_http_client(
+            5,
+            reqwest::redirect::Policy::none(),
+            None,
+            Some(("pinned.invalid", &pinned)),
+        )
+        .unwrap();
+        let resp = client
+            .get(format!("http://pinned.invalid:{}/x", addr.port()))
+            .send()
+            .await
+            .expect("resolve 钉死后应连通 mock 服务器");
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.text().await.unwrap(), "pinned-ok");
+    }
+
+    /// 【item 4】书源自带 proxy SSRF 校验：私网/回环/localhost/解析失败拒绝，公网放行
+    #[test]
+    fn test_proxy_target_is_public() {
+        // 拦截态：私网/回环/localhost/解析失败拒绝，公网放行。
+        // 注意：SSRF_TEST_LOCK 非可重入——守卫不可嵌套持有，故分块作用域串行。
+        {
+            let _g = ssrf_allow_private_guard(false);
+            for bad in [
+                "http://127.0.0.1:8080",
+                "http://10.0.0.1:3128",
+                "socks5://192.168.1.1:1080",
+                "http://172.16.0.1:8080",
+                "http://localhost:8080",
+                "http://[::1]:8080",
+                "http://[fc00::1]:8080",
+                "http://169.254.169.254:80",
+                "http://100.64.1.1:8080", // 新增 CGNAT 段
+                "not a url",              // 解析失败
+            ] {
+                assert!(!proxy_target_is_public(bad), "{bad} 应被拒绝");
+            }
+            for good in ["http://8.8.8.8:8080", "socks5://1.1.1.1:1080"] {
+                assert!(proxy_target_is_public(good), "{good} 应放行");
+            }
+        } // 守卫在此释放，避免与下方放行态守卫嵌套死锁
+        // 放行态（测试钩子）下一律通过（避免误伤 mock 代理测试）
+        {
+            let _allow = ssrf_allow_private_guard(true);
+            assert!(proxy_target_is_public("http://127.0.0.1:8080"));
+        }
+    }
+
+    /// 【item 2】响应体大小上限：Content-Length 预检超限 + 无 Content-Length 流式累计超限
+    /// 均报错；上限内正常返回。READER_HTTP_MAX_BYTES 临时置 4096（远大于其余测试响应体）。
+    #[tokio::test]
+    async fn test_fetch_response_size_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _envlk = HTTP_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ssrf = ssrf_allow_private_guard(true); // mock 绑定 127.0.0.1
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let path_big = String::from_utf8_lossy(&buf).contains("/big");
+                let path_nocl = String::from_utf8_lossy(&buf).contains("/nocl");
+                if path_nocl {
+                    // 无 Content-Length（Connection: close 界定体长）→ 走流式累计分支
+                    let big = vec![b'x'; 8192];
+                    let mut resp =
+                        b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+                    resp.extend_from_slice(&big);
+                    let _ = sock.write_all(&resp).await;
+                } else if path_big {
+                    // 声明 Content-Length: 8192 → 走预检分支
+                    let big = vec![b'x'; 8192];
+                    let mut resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        big.len()
+                    )
+                    .into_bytes();
+                    resp.extend_from_slice(&big);
+                    let _ = sock.write_all(&resp).await;
+                } else {
+                    let body = "small";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+        std::env::set_var("READER_HTTP_MAX_BYTES", "4096");
+        // 预检分支：Content-Length 8192 > 4096
+        let err = fetch(
+            &format!("http://{addr}/big"),
+            &HashMap::new(),
+            5,
+            "GET",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("响应体超过大小上限"),
+            "Content-Length 预检应拒绝: {err}"
+        );
+        // 流式分支：无 Content-Length，累计超 4096
+        let err = fetch(
+            &format!("http://{addr}/nocl"),
+            &HashMap::new(),
+            5,
+            "GET",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("响应体超过大小上限"),
+            "流式累计应拒绝: {err}"
+        );
+        // 上限内正常
+        let resp = fetch(
+            &format!("http://{addr}/small"),
+            &HashMap::new(),
+            5,
+            "GET",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.body, "small");
+        std::env::remove_var("READER_HTTP_MAX_BYTES");
+    }
+
+    /// 【item 2】http_max_bytes：缺省 32 MiB；合法值生效；非法/0 回退缺省
+    #[test]
+    fn test_http_max_bytes_env() {
+        let _envlk = HTTP_ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("READER_HTTP_MAX_BYTES");
+        assert_eq!(http_max_bytes(), 32 * 1024 * 1024);
+        std::env::set_var("READER_HTTP_MAX_BYTES", "1048576");
+        assert_eq!(http_max_bytes(), 1_048_576);
+        std::env::set_var("READER_HTTP_MAX_BYTES", "0");
+        assert_eq!(http_max_bytes(), 32 * 1024 * 1024, "0 应回退缺省");
+        std::env::set_var("READER_HTTP_MAX_BYTES", "abc");
+        assert_eq!(http_max_bytes(), 32 * 1024 * 1024, "非法值应回退缺省");
+        std::env::remove_var("READER_HTTP_MAX_BYTES");
+    }
+
+    /// 【item 5】重定向跳数上限：始终 302 自跳的服务器 → 超过 10 跳后中止报错（且不重试）
+    #[tokio::test]
+    async fn test_fetch_redirect_hop_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ssrf = ssrf_allow_private_guard(true); // 放行态：只测跳数上限，不测私网拦截
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 每跳新连接（Connection: close）；单次尝试至多 11 连接，留足余量兼容潜在重试。
+        // 注：跳数上限错误经 item 6 判定为确定性、不重试，实际只发生一次尝试。
+        tokio::spawn(async move {
+            for _ in 0..40 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{addr}/loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+            }
+        });
+        let err = fetch(
+            &format!("http://{addr}/start"),
+            &HashMap::new(),
+            5,
+            "GET",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("重定向次数过多"),
+            "应因跳数上限中止: {err:#}"
+        );
+    }
+
+    /// 【item 6】确定性错误不重试：SSRF 拦截 / URL 非法 / 缺主机名 / data URI 解码 /
+    /// 跳数上限 → retryable_http_error 返回 false（既有传输层可重试判定不受影响）
+    #[test]
+    fn test_retryable_http_error_deterministic() {
+        // 确定性拒绝：不重试
+        for msg in [
+            "目标域名 evil.com 解析到内网/回环地址（10.0.0.1），已拦截",
+            "重定向目标为内网/回环地址（127.0.0.1），已拦截",
+            "目标 URL 非法: relative URL without a base",
+            "重定向目标缺少主机名",
+            "data URI base64 解码失败: invalid",
+            "重定向次数过多（超过 10 跳），已中止",
+            "目标域名 x.com 无可用地址",
+        ] {
+            assert!(
+                !retryable_http_error(&anyhow!("{msg}")),
+                "确定性错误不应重试: {msg}"
+            );
+        }
+        // 传输层错误仍可重试（回归）
+        assert!(retryable_http_error(&anyhow!("operation timed out")));
+        assert!(retryable_http_error(&anyhow!(
+            "error sending request: connection reset"
+        )));
     }
 }

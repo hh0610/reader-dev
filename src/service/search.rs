@@ -75,16 +75,16 @@ pub fn build_search_url(search_url: &str, key: &str, page: i64, base_url: &str) 
         .replace("{key}", key)
         .replace("{page}", &page.to_string());
     // <2,3,4> 页数规则：取第 page 个（超出取最后）
-    if url.contains('<') && url.contains('>') {
-        if let Some(start) = url.find('<') {
-            if let Some(end) = url.find('>') {
-                let inner = &url[start + 1..end];
-                let pages: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
-                if !pages.is_empty() {
-                    let idx = ((page as usize).saturating_sub(1)).min(pages.len() - 1);
-                    let rep = format!("<{inner}>");
-                    url = url.replace(&rep, pages[idx]);
-                }
+    // 安全：start<end 校验——否则用户搜索词含 `>...<`（{{key}} 字面替换）时
+    // `&url[start+1..end]` 因 start>end 直接 slice panic（全源搜索静默零结果）。
+    if let (Some(start), Some(end)) = (url.find('<'), url.find('>')) {
+        if start < end {
+            let inner = &url[start + 1..end];
+            let pages: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+            if !pages.is_empty() {
+                let idx = ((page as usize).saturating_sub(1)).min(pages.len() - 1);
+                let rep = format!("<{inner}>");
+                url = url.replace(&rep, pages[idx]);
             }
         }
     }
@@ -1135,8 +1135,16 @@ fn field_url_impl(
         Some(v) => resolve_get(&expanded, v),
         None => expanded,
     };
-    // URL 型：路径或完整 URL → 直接返回（相对转绝对）；// 开头是 XPath 不在此列
-    if expanded.starts_with('/') && !expanded.starts_with("//") {
+    // URL 型：路径或完整 URL → 直接返回（相对转绝对）；// 开头是 XPath 不在此列。
+    // L5：单斜杠开头的绝对 XPath（`/html/body/a/@href`、`/div[@id]/...`）不能当字面路径，
+    // 否则规则文本被泄漏成垃圾 URL（同 tocUrl 泄漏型）——含 XPath 特征（`/@`、`[@`、
+    // `/text()`）时落到下方规则解析分支。
+    if expanded.starts_with('/')
+        && !expanded.starts_with("//")
+        && !expanded.contains("/@")
+        && !expanded.contains("[@")
+        && !expanded.contains("/text()")
+    {
         return to_absolute(&expanded, base);
     }
     if expanded.starts_with("http://") || expanded.starts_with("https://") {
@@ -1174,7 +1182,15 @@ fn expand_embedded_impl(rule: &str, context: &str, mut vars: Option<&mut RuleVar
         return rule.to_string();
     }
     let mut result = rule.to_string();
+    // 迭代上限：替换结果若含字面 `{{...}}`（页面模板未渲染时常见）会被反复展开死循环
+    // （单核 100% 且无请求超时兜底）。正常规则占位符很少，512 足够。
+    let mut guard = 0usize;
     loop {
+        guard += 1;
+        if guard > 512 {
+            tracing::warn!("expand_embedded 迭代超上限（疑似自引用 {{{{}}}} 数据），停止展开");
+            break;
+        }
         let Some(start) = result.find("{{") else {
             break;
         };
@@ -1459,6 +1475,22 @@ pub(crate) fn opt_field_with_bridge_vars(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H1 回归：搜索词含 `>...<`（{{key}} 字面替换）不得触发 build_search_url 的 slice panic。
+    #[test]
+    fn test_build_search_url_angle_bracket_key_no_panic() {
+        // 关键词 ">abc<" 使 URL 出现 '<' 在 '>' 之后 → 旧代码 &url[start+1..end] 越界 panic
+        let u = build_search_url(
+            "https://a.com/s?q={{key}}&p={{page}}",
+            ">abc<",
+            1,
+            "https://a.com",
+        );
+        assert!(u.contains(">abc<"), "关键词应原样进入 URL: {u}");
+        // 合法的 <2,3> 页数规则仍正常替换
+        let u2 = build_search_url("https://a.com/list<1,2,3>", "k", 2, "https://a.com");
+        assert_eq!(u2, "https://a.com/list2");
+    }
 
     /// E8：字段清洗四件套（legacy formatBookName/Author/wordCountFormat/kind 归一）
     #[test]
