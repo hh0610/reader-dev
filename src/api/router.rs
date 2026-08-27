@@ -7861,19 +7861,38 @@ async fn delete_book(
     // 此前只删库记录、留下磁盘文件，后台同步扫到"孤立文件"又会自动导入回书架
     // （用户实测："移出书架后再进来书又回来了"）。用户原始文件（如 ~/Downloads 里的）
     // 不受影响——这里删的是导入时落在 storage/ 下的副本。
-    let local_file = state
+    let existing = state
         .storage
         .find_book(&namespace, &book_url)
         .await
         .ok()
-        .flatten()
+        .flatten();
+    let local_file = existing
+        .as_ref()
         .and_then(|b| b.local_file.clone())
+        .filter(|p| !p.trim().is_empty());
+    // 封面/缩略图也是导入时落的盘，一并回收
+    let cover_url = existing
+        .as_ref()
+        .and_then(|b| {
+            b.custom_cover_url
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| b.cover_url.clone())
+        })
         .filter(|p| !p.trim().is_empty());
     match state.storage.delete_book(&namespace, &book_url).await {
         Ok(0) => Json(ReturnData::err("书架书籍不存在")),
         Ok(_) => {
             if let Some(rel) = local_file {
                 delete_imported_copy(&state, &namespace, &rel).await;
+            }
+            // 上传落盘的原件（data/{ns}/opds_files/{uuid}.{ext}）——**此前从未被删过**。
+            // local_file 指向的是双轨同步生成到书仓的 epub，不是这一份；
+            // 结果就是每上传一本书就永久留下一份原件（实测演示库里 13 个孤儿、112MB）。
+            delete_upload_original(&state, &namespace, &book_url).await;
+            if let Some(cov) = cover_url {
+                delete_book_cover_files(&state, &namespace, &cov).await;
             }
             Json(ReturnData::ok(serde_json::json!("删除书籍成功")))
         }
@@ -10926,6 +10945,78 @@ async fn delete_imported_copy(state: &AppState, ns: &str, local_file: &str) {
     match tokio::fs::remove_file(&file_abs).await {
         Ok(()) => tracing::info!("移出本地书 [{ns}]：已删除导入副本 {}", file_abs.display()),
         Err(e) => tracing::warn!("移出本地书：删除副本失败 [{}]: {e}", file_abs.display()),
+    }
+}
+
+/// 删除上传落盘的原始文件 `data/{ns}/opds_files/{uuid}.{ext}`。
+///
+/// 只处理 `local://{uuid}` 形态；扫描导入的书（`local://store/{hash}`）没有这份副本，
+/// 它的原件是用户自己放在书仓/目录里的文件，**不能删**。
+async fn delete_upload_original(state: &AppState, ns: &str, book_url: &str) {
+    let Some(id) = book_url.strip_prefix("local://") else {
+        return;
+    };
+    // store/ 前缀是扫描导入——原件属于用户，不碰
+    if id.is_empty() || id.contains('/') {
+        return;
+    }
+    let dir = state
+        .storage
+        .config
+        .storage_dir()
+        .join("data")
+        .join(ns)
+        .join("opds_files");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_file()
+            && p.file_stem()
+                .map(|s| s.to_string_lossy() == id)
+                .unwrap_or(false)
+        {
+            match tokio::fs::remove_file(&p).await {
+                Ok(()) => tracing::info!("移出本地书 [{ns}]：已删除上传原件 {}", p.display()),
+                Err(e) => tracing::warn!("移出本地书：删除上传原件失败 [{}]: {e}", p.display()),
+            }
+        }
+    }
+}
+
+/// 删除导入时落盘的封面与其缩略图（`/assets/{ns}/covers/{file}`）。
+/// 远程封面 URL、他人命名空间的路径一律跳过。
+async fn delete_book_cover_files(state: &AppState, ns: &str, cover_url: &str) {
+    let Some(rest) = cover_url.strip_prefix("/assets/") else {
+        return; // 远程封面或其它形态
+    };
+    let Some((url_ns, rest)) = rest.split_once('/') else {
+        return;
+    };
+    // 只删本命名空间下的；跨 ns 路径直接拒绝
+    if url_ns != ns {
+        return;
+    }
+    let Some(file) = rest.strip_prefix("covers/") else {
+        return;
+    };
+    if file.is_empty() || file.contains('/') || file.contains('\\') || file.contains("..") {
+        return;
+    }
+    let covers = state
+        .storage
+        .config
+        .storage_dir()
+        .join("assets")
+        .join(ns)
+        .join("covers");
+    for p in [covers.join(file), covers.join("thumbs").join(file)] {
+        if p.is_file() {
+            if let Err(e) = tokio::fs::remove_file(&p).await {
+                tracing::debug!("移出本地书：删除封面失败 [{}]: {e}", p.display());
+            }
+        }
     }
 }
 
@@ -22235,6 +22326,92 @@ mod tests {
             .unwrap();
         assert!(locked.contains("name"), "改过的字段应加锁：{locked:?}");
         assert!(!locked.contains("author"), "没改的字段不该加锁：{locked:?}");
+
+        cleanup(state, dir).await;
+    }
+
+    /// deleteBook 回收导入落盘的文件：上传原件 + 封面 + 缩略图；
+    /// 扫描导入的书（原件属于用户）不得被删
+    #[tokio::test]
+    async fn test_delete_book_reclaims_imported_files() {
+        let (state, dir) = test_state("delreclaim").await;
+        let root = state.storage.config.storage_dir();
+        let opds = root.join("data").join("default").join("opds_files");
+        let covers = root.join("assets").join("default").join("covers");
+        std::fs::create_dir_all(&opds).unwrap();
+        std::fs::create_dir_all(covers.join("thumbs")).unwrap();
+
+        let mk = |url: &str, cover: Option<&str>| {
+            let info = crate::model::book_chapter::BookInfo {
+                name: format!("书 {url}"),
+                author: "作者".into(),
+                book_url: url.into(),
+                origin: "local".into(),
+                origin_name: "本地书".into(),
+                toc_url: Some(format!("{url}/toc")),
+                cover_url: cover.map(|c| c.to_string()),
+                ..Default::default()
+            };
+            let imported = crate::service::local_book::ImportedBook {
+                meta: Default::default(),
+                chapters: vec![crate::service::local_book::Chapter {
+                    title: "第一章".into(),
+                    content: "正文".into(),
+                }],
+                cover: None,
+                format: "txt".into(),
+            };
+            (info, imported)
+        };
+        let del = |url: &'static str| {
+            let state = state.clone();
+            async move {
+                delete_book(
+                    AxumState(state),
+                    Query(HashMap::new()),
+                    HeaderMap::new(),
+                    Some(Bytes::from(json!({ "bookUrl": url }).to_string())),
+                )
+                .await
+            }
+        };
+
+        // ① 上传导入的书：原件 + 封面 + 缩略图都应被回收
+        let (info, imp) = mk("local://up-1", Some("/assets/default/covers/cv1.jpg"));
+        state.storage.save_local_book("default", &info, &imp).await.unwrap();
+        std::fs::write(opds.join("up-1.epub"), b"original upload").unwrap();
+        std::fs::write(covers.join("cv1.jpg"), b"cover").unwrap();
+        std::fs::write(covers.join("thumbs").join("cv1.jpg"), b"thumb").unwrap();
+
+        let ret = del("local://up-1").await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert!(
+            !opds.join("up-1.epub").exists(),
+            "上传原件必须一起删除——否则每传一本就永久留下一份（实测演示库 13 个孤儿、112MB）"
+        );
+        assert!(!covers.join("cv1.jpg").exists(), "封面应回收");
+        assert!(!covers.join("thumbs").join("cv1.jpg").exists(), "缩略图应回收");
+
+        // ② 扫描导入的书：原件是用户自己放的文件，**不能删**
+        let user_file = root.join("user-owned.txt");
+        std::fs::write(&user_file, b"user's own file").unwrap();
+        let (info2, imp2) = mk("local://store/abcdef", None);
+        state.storage.save_local_book("default", &info2, &imp2).await.unwrap();
+        // 同名 stem 的文件也放进 opds_files，验证 store/ 分支不会误伤
+        std::fs::write(opds.join("abcdef.txt"), b"unrelated").unwrap();
+
+        let ret = del("local://store/abcdef").await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert!(
+            opds.join("abcdef.txt").exists(),
+            "扫描导入的书没有上传副本，不该按 uuid 去 opds_files 里乱删同名文件"
+        );
+
+        // ③ 远程封面 URL 不触发任何文件删除
+        let (info3, imp3) = mk("local://up-3", Some("https://example.com/c.jpg"));
+        state.storage.save_local_book("default", &info3, &imp3).await.unwrap();
+        let ret = del("local://up-3").await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
 
         cleanup(state, dir).await;
     }
