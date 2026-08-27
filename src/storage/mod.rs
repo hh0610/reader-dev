@@ -1336,6 +1336,28 @@ impl Storage {
         Ok(())
     }
 
+    /// 清理过期的书级变量缓存（`book_vars_cache` 此前**只写不清**，永久增长）。
+    ///
+    /// 这张表是 `@put`/`@get` 的跨请求存储，按 (ns, 源, url) 一行；
+    /// 每读一本书就新增几十上百行，且没有任何过期机制。保留期外的直接删除——
+    /// 变量丢了最多让下次求值重新 `@put` 一遍，代价远小于让库无限膨胀。
+    ///
+    /// 返回删除行数。
+    pub async fn prune_book_vars_cache(&self, keep_days: i64) -> Result<u64> {
+        if keep_days <= 0 {
+            return Ok(0);
+        }
+        let cutoff = chrono::Utc::now().timestamp_millis() - keep_days * 24 * 3600 * 1000;
+        let r = sqlx::query(
+            // updated_at=0 是历史数据（早期写入没带时间戳）——一并清掉
+            "DELETE FROM book_vars_cache WHERE updated_at = 0 OR updated_at < ?1",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
     /// 启动加载：全部未过期条目 (user_namespace, key, value, expiry)
     pub async fn load_js_cache(&self) -> Result<Vec<(String, String, String, i64)>> {
         let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
@@ -6530,6 +6552,51 @@ mod tests {
         );
 
         cleanup(storage, "ns").await;
+    }
+
+    /// book_vars_cache 保留期清理（此前只写不清、永久增长）
+    #[tokio::test]
+    async fn 书级变量缓存按保留期清理() {
+        let storage = test_storage("varsprune").await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let day = 24 * 3600 * 1000i64;
+        // 直接写三行：新的 / 超期的 / 历史无时间戳的
+        for (url, ts) in [
+            ("https://b/new", now - day),
+            ("https://b/old", now - 60 * day),
+            ("https://b/legacy", 0),
+        ] {
+            sqlx::query(
+                "INSERT INTO book_vars_cache (user_namespace, source_url, url, vars_json, updated_at) \
+                 VALUES ('default','s',?1,'{}',?2)",
+            )
+            .bind(url)
+            .bind(ts)
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+        }
+        let n = storage.prune_book_vars_cache(30).await.unwrap();
+        assert_eq!(n, 2, "应删掉超期的与无时间戳的历史行");
+        let left: Vec<String> =
+            sqlx::query_scalar("SELECT url FROM book_vars_cache ORDER BY url")
+                .fetch_all(&storage.pool)
+                .await
+                .unwrap();
+        assert_eq!(left, vec!["https://b/new".to_string()], "保留期内的必须留下");
+
+        // keep_days <= 0 视为不清理（给运维一个关掉的开关）
+        assert_eq!(storage.prune_book_vars_cache(0).await.unwrap(), 0);
+        assert_eq!(storage.prune_book_vars_cache(-1).await.unwrap(), 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM book_vars_cache")
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap(),
+            1
+        );
+
+        cleanup(storage, "varsprune").await;
     }
 
     /// INSERT OR REPLACE 会重置未列出列：upsert_book / save_local_book 都必须显式写回

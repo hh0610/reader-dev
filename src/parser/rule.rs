@@ -140,6 +140,21 @@ impl std::ops::DerefMut for RuleVars {
 const BOOK_VARS_CACHE_MAX: usize = 512;
 const BOOK_VARS_ENTRIES_MAX: usize = 64;
 const BOOK_VARS_BYTES_MAX: usize = 1024 * 1024;
+/// 单个变量值上限：`@put` 存的是 token/分类 id 之类的短值，
+/// 几十 KB 起步的一定是被误塞进来的页面正文，直接丢弃
+const BOOK_VARS_VALUE_MAX: usize = 32 * 1024;
+
+/// **不落库**的瞬态上下文键。
+///
+/// 这些键不是 `@put` 变量，而是规则求值时临时绑定的当前页上下文：
+/// `src` = 当前页文档、`result` = 上一步 JS 的产物、`baseUrl` = 当前请求地址。
+/// 它们在每次求值时都会按当前页重新写入，持久化没有意义，而且有两重害处：
+///
+/// 1. **体积**：`analyze_toc` 会把整页 HTML 塞进 `src`，再**给每个章节各存一份**——
+///    一页 100 章的目录就是同一份页面落库 100 次。实测一个只读过几本书的库，
+///    book_vars_cache 一张表 970MB / 13558 行，平均每行 64KB，最大单行 299KB。
+/// 2. **正确性**：下次求值若命中这份陈旧的 `src`，规则读到的是**上一次请求的页面**。
+const BOOK_VARS_TRANSIENT_KEYS: &[&str] = &["src", "result", "baseUrl"];
 
 static BOOK_VARS_CACHE: std::sync::RwLock<Vec<((String, String, String), RuleVars)>> =
     std::sync::RwLock::new(Vec::new());
@@ -312,6 +327,21 @@ pub fn save_book_vars(ns: &str, source: &str, book_url: &str, vars: &RuleVars) {
     let mut capped = RuleVars::new();
     let mut bytes = 0usize;
     for (k, v) in vars.iter() {
+        // 瞬态上下文不保存（见 BOOK_VARS_TRANSIENT_KEYS）：每次求值都会按当前页重新绑定，
+        // 存下来只会撑爆库，还可能让下次求值读到上一次的页面
+        if BOOK_VARS_TRANSIENT_KEYS.contains(&k.as_str()) {
+            continue;
+        }
+        // 单值过大：几乎必然是被误塞进来的页面正文，丢弃而不是把整轮循环 break 掉
+        // （break 会连后面正常的小变量一起丢）
+        if v.len() > BOOK_VARS_VALUE_MAX {
+            tracing::debug!(
+                "book_vars 丢弃超大变量 [{k}]（{} KB > {} KB）",
+                v.len() / 1024,
+                BOOK_VARS_VALUE_MAX / 1024
+            );
+            continue;
+        }
         if capped.len() >= BOOK_VARS_ENTRIES_MAX {
             break;
         }
@@ -3092,6 +3122,61 @@ mod tests {
         assert_eq!(loaded.get("bid").map(String::as_str), Some("42"));
         assert!(loaded.chapter_title.is_none(), "章标题上下文不应持久化");
         assert!(loaded.book_name.is_none(), "书名上下文不应持久化");
+    }
+
+    /// 瞬态上下文（src/result/baseUrl）不得进入书级变量缓存。
+    ///
+    /// 这是实测踩到的问题：analyze_toc 把整页 HTML 塞进 src，再给**每个章节各存一份**，
+    /// 一页 100 章就是同一份页面落库 100 次。一个只读过几本书的库里
+    /// book_vars_cache 一张表 970MB / 13558 行（平均 64KB/行，最大单行 299KB）。
+    #[test]
+    fn 瞬态上下文不进书级变量缓存() {
+        let mut vars = RuleVars::new();
+        vars.insert("src".to_string(), "<html>整页正文……</html>".repeat(100));
+        vars.insert("result".to_string(), "上一步 JS 的产物".to_string());
+        vars.insert("baseUrl".to_string(), "https://b.test/c/1".to_string());
+        // 真正的 @put 变量必须保留
+        vars.insert("token".to_string(), "abc123".to_string());
+        vars.insert("sortId".to_string(), "7".to_string());
+
+        save_book_vars("ns-transient", "src-t", "https://b.test/1", &vars);
+        let got = load_book_vars("ns-transient", "src-t", "https://b.test/1");
+
+        assert_eq!(got.get("token").map(String::as_str), Some("abc123"), "@put 变量应保留");
+        assert_eq!(got.get("sortId").map(String::as_str), Some("7"));
+        assert!(got.get("src").is_none(), "src 是当前页文档，不该被持久化");
+        assert!(got.get("result").is_none(), "result 是上一步 JS 产物，不该被持久化");
+        assert!(
+            got.get("baseUrl").is_none(),
+            "baseUrl 每次求值都会按当前请求重新绑定，存下来只会让下次读到陈旧值"
+        );
+    }
+
+    /// 超大单值丢弃，但不能连带把后面正常的小变量一起丢
+    #[test]
+    fn 超大变量丢弃不影响其它变量() {
+        let mut vars = RuleVars::new();
+        vars.insert("huge".to_string(), "x".repeat(BOOK_VARS_VALUE_MAX + 1));
+        for i in 0..5 {
+            vars.insert(format!("k{i}"), format!("v{i}"));
+        }
+        save_book_vars("ns-huge", "src-h", "https://b.test/2", &vars);
+        let got = load_book_vars("ns-huge", "src-h", "https://b.test/2");
+        assert!(got.get("huge").is_none(), "超大值应被丢弃");
+        for i in 0..5 {
+            assert_eq!(
+                got.get(&format!("k{i}")).map(String::as_str),
+                Some(format!("v{i}").as_str()),
+                "超大值不该把同批次其它变量带走（早期实现是 break，会连后面的一起丢）"
+            );
+        }
+        // 刚好等于上限的值应保留（边界）
+        let mut ok = RuleVars::new();
+        ok.insert("edge".to_string(), "y".repeat(BOOK_VARS_VALUE_MAX));
+        save_book_vars("ns-huge", "src-h", "https://b.test/3", &ok);
+        assert!(load_book_vars("ns-huge", "src-h", "https://b.test/3")
+            .get("edge")
+            .is_some());
     }
 
     /// E10/AR5：push_js_context 把章节/书上下文以保留键写入 JS 变量表——

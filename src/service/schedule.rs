@@ -95,8 +95,24 @@ pub fn spawn_auto_backup_job(storage: Storage) {
                 }
                 Err(e) => tracing::warn!("自动备份失败: {e:#}"),
             }
+            // 顺带做库维护：book_vars_cache 此前只写不清、永久增长
+            // （实测一个只读过几本书的库涨到 970MB）。放在备份之后跑——
+            // 万一清错了，当天的备份里还有。
+            match storage.prune_book_vars_cache(book_vars_keep_days()).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("书级变量缓存清理：删除 {n} 行"),
+                Err(e) => tracing::warn!("书级变量缓存清理失败: {e:#}"),
+            }
         }
     });
+}
+
+/// 书级变量缓存保留天数（env READER_BOOK_VARS_KEEP_DAYS，默认 30；<=0 表示不清理）
+fn book_vars_keep_days() -> i64 {
+    std::env::var("READER_BOOK_VARS_KEEP_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(30)
 }
 
 /// 自动备份（GAP #57）：各命名空间 → webdav/legado/auto-YYYYMMDD.zip（同日跳过）→
