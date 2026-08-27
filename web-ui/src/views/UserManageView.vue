@@ -625,12 +625,12 @@ onBeforeUnmount(() => {
                 </button>
               </th>
               <th class="col-user">用户名</th>
-              <th class="col-perm">权限</th>
-              <th class="col-num">书源上限</th>
+              <th class="col-perm sep">权限</th>
+              <th class="col-num sep">书源上限</th>
               <th class="col-num">书籍上限</th>
-              <th class="col-time">最后登录</th>
+              <th class="col-time sep">最后登录</th>
               <th class="col-time">注册时间</th>
-              <th class="col-ops">操作</th>
+              <th class="col-ops sep">操作</th>
             </tr>
           </thead>
           <tbody>
@@ -656,9 +656,14 @@ onBeforeUnmount(() => {
                 <span v-if="u.username === store.username" class="self-tag" title="当前登录账号">我</span>
                 <span v-if="u.isAdmin" class="admin-tag" title="管理员（可操作系统 default 配置）">管理员</span>
               </td>
-              <td class="col-perm">
+              <td class="col-perm sep">
                 <div class="perm-cell">
-                  <template v-for="(label, field) in PERM_LABEL" :key="field">
+                  <label
+                    v-for="(label, field) in PERM_LABEL"
+                    :key="field"
+                    class="perm-item"
+                    :title="`${label}：${u[field as PermField] ? '开' : '关'}`"
+                  >
                     <button
                       class="switch"
                       :class="{ on: u[field as PermField] }"
@@ -666,20 +671,19 @@ onBeforeUnmount(() => {
                       type="button"
                       role="switch"
                       :aria-checked="u[field as PermField]"
-                      :title="`${label}：${u[field as PermField] ? '开' : '关'}`"
                       @click="togglePerm(u, field as PermField)"
                     >
                       <span class="switch-knob"></span>
                     </button>
                     <span class="perm-label">{{ label }}</span>
-                  </template>
+                  </label>
                 </div>
               </td>
-              <td class="col-num">{{ u.bookSourceLimit ?? 0 }}</td>
+              <td class="col-num sep">{{ u.bookSourceLimit ?? 0 }}</td>
               <td class="col-num">{{ u.bookLimit ?? 0 }}</td>
-              <td class="col-time">{{ fmtTime(u.lastLoginAt) }}</td>
+              <td class="col-time sep">{{ fmtTime(u.lastLoginAt) }}</td>
               <td class="col-time">{{ u.createdAt ? fmtTime(u.createdAt) : '—' }}</td>
-              <td class="col-ops">
+              <td class="col-ops sep">
                 <button class="op-btn" type="button" @click="openEdit(u)">编辑</button>
                 <button class="op-btn" type="button" @click="openReset(u)">重置密码</button>
                 <button
@@ -960,7 +964,8 @@ onBeforeUnmount(() => {
 
 /* ================= 内容区 ================= */
 .content {
-  width: min(1080px, 100%);
+  /* 数据表而非正文：容器比其他页更宽，避免 8 列表格被挤到横向滚动 */
+  width: min(1280px, 100%);
   margin: 0 auto;
   padding: 48px 32px 72px;
 }
@@ -1155,30 +1160,46 @@ onBeforeUnmount(() => {
 }
 
 /* ================= 细字表格 ================= */
+/* 表格整体是一张有边框的卡片；列放不下时横向滚动，而不是把内容压扁 */
 .table-wrap {
   overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--card);
 }
 .user-table {
   width: 100%;
-  min-width: 980px;
+  min-width: 1120px; /* 需容纳 5 组权限开关；不足则 .table-wrap 横向滚动 */
   border-collapse: collapse;
 }
 .user-table th {
-  padding: 10px 14px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 11px 13px;
   text-align: left;
   font-size: 11.5px;
   font-weight: 300;
   letter-spacing: 1px;
   color: var(--text-3);
-  border-bottom: 1px solid var(--border);
+  background: var(--card);
+  border-bottom: 1px solid var(--border-strong);
 }
 .user-table td {
-  padding: 12px 14px;
+  padding: 12px 13px;
   font-size: 12.5px;
   font-weight: 300;
   color: var(--text-2);
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
+}
+.user-table tbody tr:last-child td {
+  border-bottom: none;
+}
+/* 竖向分隔：把「用户名 | 权限 | 上限 | 时间 | 操作」几组切开，边界一眼可辨 */
+.user-table th.sep,
+.user-table td.sep {
+  border-left: 1px solid var(--border);
 }
 .user-table tbody tr {
   transition: background-color 0.15s ease;
@@ -1187,19 +1208,28 @@ onBeforeUnmount(() => {
   background: var(--hover);
 }
 .col-user {
-  width: 20%;
+  width: 15%;
+  min-width: 130px;
+  white-space: nowrap; /* 「我」「管理员」标签不再换到第二行 */
 }
 .col-perm {
-  width: 28%;
+  width: 34%; /* 五组权限开关需要更宽，否则文字被挤成竖排 */
+  min-width: 300px;
 }
 .col-num {
   width: 7%;
+  min-width: 64px;
+  white-space: nowrap; /* 「书源上限」表头不再竖排 */
 }
 .col-time {
-  width: 14%;
+  width: 12%;
+  min-width: 116px;
+  white-space: nowrap; /* 日期时间不再折成多行 */
 }
 .col-ops {
-  width: 18%;
+  width: 16%;
+  min-width: 168px;
+  white-space: nowrap;
   white-space: nowrap;
 }
 .col-check {
@@ -1272,15 +1302,26 @@ onBeforeUnmount(() => {
 
 /* 权限开关组：极简圆角开关 + 细字标签 */
 .perm-cell {
+  /* 固定 3 列：两行对齐成整齐的 3×2 网格，不做参差的自由换行 */
+  display: grid;
+  grid-template-columns: repeat(3, max-content);
+  align-items: center;
+  gap: 8px 16px;
+}
+/* 开关与其文字作为一个整体：white-space:nowrap 防止「本地书仓」被拆成竖排单字 */
+.perm-item {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
 }
 .perm-label {
-  margin-right: 6px;
   font-size: 11.5px;
   font-weight: 300;
   color: var(--text-3);
+  white-space: nowrap;
 }
 
 /* 极简圆角开关（与设置页一致） */

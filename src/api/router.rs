@@ -5959,7 +5959,7 @@ async fn search_book_source_sse(
     // ② 全部启用可搜索书源（排除当前源）
     // bookSourceType 过滤（0 文本/1 音频/2 漫画/3 文件/4 视频）：只探测同类型源——
     // 拿漫画源搜文字书必然无正文，白耗请求与时间。缺省不传 = 不过滤。
-    let type_filter = parse_book_source_type(&params, body_json.as_ref());
+    let type_filter = parse_book_source_type(&params, None);
     let current = book_source_param.trim();
     let sources: Vec<crate::model::BookSource> =
         match state.storage.get_book_sources(&namespace).await {
@@ -8233,9 +8233,13 @@ async fn get_explore_sources(
         Ok(s) => s,
         Err(_) => return Json(ReturnData::err("系统错误")),
     };
+    // 类型过滤（0 文本/1 音频/2 漫画/3 文件/4 视频）：缺省不过滤。
+    // 返回值一并带上 bookSourceType，供前端做分类筛选与展示。
+    let type_filter = parse_book_source_type(&params, None);
     let list: Vec<serde_json::Value> = sources
         .iter()
         .filter(|s| s.enabled_explore && s.explore_url.is_some())
+        .filter(|s| type_filter.map(|t| s.book_source_type == t).unwrap_or(true))
         .map(|s| {
             let count = crate::service::explore::parse_explore_entries(
                 s.explore_url.as_deref().unwrap_or(""),
@@ -8244,6 +8248,7 @@ async fn get_explore_sources(
             serde_json::json!({
                 "bookSourceUrl": s.book_source_url,
                 "bookSourceName": s.book_source_name,
+                "bookSourceType": s.book_source_type,
                 "categoryCount": count,
             })
         })

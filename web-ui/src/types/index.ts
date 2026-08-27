@@ -146,6 +146,8 @@ export interface ExploreSourceInfo {
   bookSourceUrl: string
   bookSourceName: string
   categoryCount: number
+  /** 书源类型：0 文本/1 音频/2 漫画/3 文件/4 视频（后端 getExploreSources 一并返回，供前端分类筛选） */
+  bookSourceType?: number
 }
 
 export interface ExploreCategory {

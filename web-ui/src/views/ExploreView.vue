@@ -119,30 +119,53 @@
         <p class="state-text">没有支持探索的书源</p>
         <router-link class="link" to="/sources">前往书源管理</router-link>
       </div>
-      <ul v-else-if="shownSources.length > 0" class="source-list">
-        <li
-          v-for="s in shownSources"
-          :key="s.bookSourceUrl"
-          class="source-item"
-          :class="{ fav: isFavSource(s.bookSourceUrl) }"
-          @click="selectSource(s)"
-        >
-          <span
-            class="src-star"
+      <template v-else>
+        <!-- 类型筛选：书源列表已全量在手，前端筛选即可，不再往返请求 -->
+        <div v-if="shownTypes.length > 1" class="type-filter">
+          <button
+            v-for="tp in shownTypes"
+            :key="tp.v"
+            class="type-chip"
+            :class="{ active: activeExploreType === tp.v }"
+            type="button"
+            :title="`只看${tp.label}类书源`"
+            @click="pickExploreType(tp.v)"
+          >
+            {{ tp.label }}<span class="chip-num">{{ typeCounts[tp.v] ?? 0 }}</span>
+          </button>
+        </div>
+
+        <ul v-if="shownSources.length > 0" class="source-list">
+          <li
+            v-for="s in shownSources"
+            :key="s.bookSourceUrl"
+            class="source-item"
             :class="{ fav: isFavSource(s.bookSourceUrl) }"
-            :title="isFavSource(s.bookSourceUrl) ? `取消收藏「${s.bookSourceName}」` : `收藏「${s.bookSourceName}」（我的探索）`"
-            @click.stop="toggleFavSource(s)"
-          >{{ isFavSource(s.bookSourceUrl) ? '★' : '☆' }}</span>
-          <span class="source-name">{{ applyHan(s.bookSourceName, hanMode) }}</span>
-          <span class="source-count">{{ exploreCount(s) }} 个分类</span>
-          <span class="chevron">›</span>
-        </li>
-      </ul>
-      <div v-else class="state">
-        <p class="state-text">「我的探索」暂无收藏的书源</p>
-        <p class="state-hint">在书源行点击 ☆ 即可收藏，收藏后从此处快速进入</p>
-        <button class="retry" type="button" @click="favSourcesOnly = false">查看全部书源</button>
-      </div>
+            @click="selectSource(s)"
+          >
+            <span
+              class="src-star"
+              :class="{ fav: isFavSource(s.bookSourceUrl) }"
+              :title="isFavSource(s.bookSourceUrl) ? `取消收藏「${s.bookSourceName}」` : `收藏「${s.bookSourceName}」（我的探索）`"
+              @click.stop="toggleFavSource(s)"
+            >{{ isFavSource(s.bookSourceUrl) ? '★' : '☆' }}</span>
+            <span class="source-name">{{ applyHan(s.bookSourceName, hanMode) }}</span>
+            <span class="source-count">{{ exploreCount(s) }} 个分类</span>
+            <span class="chevron">›</span>
+          </li>
+        </ul>
+        <div v-else class="state">
+          <template v-if="favSourcesOnly && typeCounts[''] === 0">
+            <p class="state-text">「我的探索」暂无收藏的书源</p>
+            <p class="state-hint">在书源行点击 ☆ 即可收藏，收藏后从此处快速进入</p>
+            <button class="retry" type="button" @click="favSourcesOnly = false">查看全部书源</button>
+          </template>
+          <template v-else>
+            <p class="state-text">没有该类型的探索书源</p>
+            <button class="retry" type="button" @click="pickExploreType('')">查看全部类型</button>
+          </template>
+        </div>
+      </template>
     </main>
 
     <!-- 书源探索页：分类 + 书籍 -->
@@ -335,11 +358,50 @@ function toggleFavSource(s: ExploreSourceInfo) {
 
 /** 「我的探索」：只看收藏书源（顶栏切换） */
 const favSourcesOnly = ref(false)
-const shownSources = computed(() =>
-  favSourcesOnly.value
+
+/* ============ 书源类型筛选（与搜索页同一套语义：0 文本/1 音频/2 漫画/3 文件/4 视频） ============
+ * 探索书源列表一次拉全，故在前端筛选即可，不再往返请求。
+ * 缺省「全部」——探索是「逛」，不像搜索那样默认收窄，避免用户收藏的漫画源凭空消失。 */
+const EXPLORE_TYPE_KEY = 'reader_explore_source_type'
+const EXPLORE_TYPES: Array<{ v: string; label: string }> = [
+  { v: '', label: '全部' },
+  { v: '0', label: '小说' },
+  { v: '2', label: '漫画' },
+  { v: '1', label: '音频' },
+  { v: '4', label: '视频' },
+  { v: '3', label: '文件' },
+]
+const activeExploreType = ref<string>(localStorage.getItem(EXPLORE_TYPE_KEY) ?? '')
+/** 各类型书源数量（用于胶囊上的计数，并隐藏计数为 0 的类型） */
+const typeCounts = computed<Record<string, number>>(() => {
+  const base = favSourcesOnly.value
     ? sources.value.filter((s) => isFavSource(s.bookSourceUrl))
-    : sources.value,
-)
+    : sources.value
+  const m: Record<string, number> = { '': base.length }
+  for (const s of base) {
+    const k = String(s.bookSourceType ?? 0)
+    m[k] = (m[k] ?? 0) + 1
+  }
+  return m
+})
+const shownTypes = computed(() => EXPLORE_TYPES.filter((t) => t.v === '' || (typeCounts.value[t.v] ?? 0) > 0))
+function pickExploreType(v: string) {
+  if (activeExploreType.value === v) return
+  activeExploreType.value = v
+  try {
+    localStorage.setItem(EXPLORE_TYPE_KEY, v)
+  } catch {
+    /* 隐私模式等：忽略持久化失败 */
+  }
+}
+const shownSources = computed(() => {
+  const base = favSourcesOnly.value
+    ? sources.value.filter((s) => isFavSource(s.bookSourceUrl))
+    : sources.value
+  const t = activeExploreType.value
+  if (t === '') return base
+  return base.filter((s) => String(s.bookSourceType ?? 0) === t)
+})
 /** 全站共享简繁模式（书海/搜索/目录/书源名统一响应，见 utils/hanMode.ts） */
 const hanMode = useHanMode()
 function toggleHan() {
@@ -972,6 +1034,44 @@ onBeforeUnmount(() => {
   color: var(--accent, #4f46e5);
   text-decoration: none;
 }
+/* 类型筛选胶囊（与搜索页视觉一致） */
+.type-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.type-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 12px;
+  font-weight: 300;
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease,
+    background-color 0.15s ease;
+}
+.type-chip:hover {
+  color: var(--text-1);
+  border-color: var(--border-strong);
+}
+.type-chip.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft, transparent);
+}
+.chip-num {
+  font-size: 10.5px;
+  opacity: 0.65;
+}
+
 .source-list {
   list-style: none;
   margin: 0;
