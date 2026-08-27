@@ -3630,6 +3630,45 @@ async fn get_book_toc(
     .await
     {
         Ok(chapters) if chapters.is_empty() => {
+            // 目录为空的常见成因之一：调用方只有 bookUrl（换源候选源的搜索结果通常不带
+            // tocUrl），而该源的目录在**独立目录页**上——拿详情页套 ruleToc 自然 0 章。
+            // 回退一次：抓详情取真实 tocUrl 再解析（tocUrl 与入参不同才值得重试）。
+            if toc_url == url_param && !url_param.is_empty() {
+                if let Ok(info) =
+                    crate::service::book::fetch_book_info(&namespace, &url_param, &source, None)
+                        .await
+                {
+                    if let Some(real_toc) = info.toc_url.filter(|t| !t.is_empty() && *t != toc_url)
+                    {
+                        if let Ok(retry) = crate::service::book::analyze_toc(
+                            &namespace,
+                            &real_toc,
+                            &source,
+                            20,
+                            shelf_for_write.as_ref().map(|b| b.name.as_str()),
+                            url_param.as_str(),
+                        )
+                        .await
+                        {
+                            if !retry.is_empty() {
+                                tracing::debug!(
+                                    "getBookToc 经详情页回退取到目录 [{real_toc}]：{} 章",
+                                    retry.len()
+                                );
+                                if let Ok(json) = serde_json::to_string(&retry) {
+                                    let _ = state
+                                        .storage
+                                        .cache_toc(&namespace, &url_param, &real_toc, &json)
+                                        .await;
+                                }
+                                return Json(ReturnData::ok(
+                                    serde_json::to_value(retry).unwrap_or(serde_json::Value::Null),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
             // 解析成功但目录为空 = 书源目录规则失效/上游返回验证页（legado TocEmptyException）。
             // 此前静默返回 isSuccess:true + 空数组 → 前端「未获取到章节目录」无法区分规则错/网络错，
             // 且日志无 error。改为明确业务错误，并记 lastCheckError。
@@ -23044,5 +23083,69 @@ mod tests {
         // find_ascii_ci：大小写不敏感且偏移正确
         assert_eq!(find_ascii_ci("ab</Body>cd", "</body>"), Some(2));
         assert_eq!(find_ascii_ci("abc", "xyz"), None);
+    }
+
+    /// 回归：换源候选源常只有 bookUrl（搜索规则不返回 tocUrl）。若该源的目录在
+    /// **独立目录页**，拿详情页套 ruleToc 会得到 0 章 → 应自动抓详情取真实 tocUrl 重试，
+    /// 而不是直接报「未解析到章节」。
+    #[tokio::test]
+    async fn test_get_book_toc_falls_back_via_book_info() {
+        let _ssrf = crate::service::crawler::ssrf_allow_private_guard(true); // mock 绑 127.0.0.1
+        let (state, dir) = test_state("tocfallback").await;
+        // 详情页：无章节列表，但含指向独立目录页的链接
+        let detail = r#"<html><body><h1 class="bn">测试书</h1>
+            <a class="toclink" href="/toc/1">目录</a></body></html>"#;
+        // 目录页：真正的章节列表
+        let toc = r#"<html><body><div class="cl">
+            <a href="/c/1">第一章 起</a><a href="/c/2">第二章 承</a></div></body></html>"#;
+        let base = serve_bodies_by_path(vec![
+            ("/book/1".to_string(), detail.to_string()),
+            ("/toc/1".to_string(), toc.to_string()),
+        ])
+        .await;
+        // serve_bodies_by_path 返回 http://host:port/sources.json —— 取主机部分作 origin
+        let origin = base.trim_end_matches("/sources.json").to_string();
+        let src = crate::model::BookSource {
+            book_source_url: origin.clone(),
+            book_source_name: "回退测试源".into(),
+            enabled: true,
+            search_url: Some(format!("{origin}/s?k={{{{key}}}}")),
+            // 详情规则给出 tocUrl（独立目录页）
+            rule_book_info: Some(serde_json::json!({
+                "name": "h1.bn@text",
+                "tocUrl": "a.toclink@href"
+            })),
+            // 目录规则只在目录页命中
+            rule_toc: Some(serde_json::json!({
+                "chapterList": "div.cl@a",
+                "chapterName": "text",
+                "chapterUrl": "href"
+            })),
+            ..Default::default()
+        };
+        state.storage.save_book_source("default", &src).await.unwrap();
+
+        // 只给 bookUrl（tocUrl 与之相同）——模拟换源候选源
+        let book_url = format!("{origin}/book/1");
+        let mut params = HashMap::new();
+        params.insert("tocUrl".to_string(), book_url.clone());
+        params.insert("url".to_string(), book_url.clone());
+        params.insert("bookSource".to_string(), origin.clone());
+        let ret = get_book_toc(
+            AxumState(state.clone()),
+            Query(params),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(
+            ret.0.is_success,
+            "应经详情页回退取到目录，而非报错: {}",
+            ret.0.error_msg
+        );
+        let chapters = ret.0.data.as_array().cloned().unwrap_or_default();
+        assert_eq!(chapters.len(), 2, "应取到 2 章: {:?}", ret.0.data);
+
+        cleanup(state, dir).await;
     }
 }
