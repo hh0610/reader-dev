@@ -3327,15 +3327,23 @@ fn read_zip_limited<R: std::io::Read + std::io::Seek>(
     // 精确名查不到时，按编码回退后的名字再找一次（再不行按大小写不敏感找）。
     if zip.by_name(path).is_err() {
         if let Some(idx) = zip_index_by_decoded_name(zip, path) {
-            return read_zip_index(zip, idx);
+            // 注意仍用调用方传入的 max_bytes——早期实现这里走 read_zip_index（固定 500MB 上限），
+            // 等于回退路径悄悄绕过了调用方的自定义上限（函数契约被破坏）
+            let f = zip.by_index(idx)?;
+            return read_limited(f, path, max_bytes);
         }
     }
-    let mut f = zip.by_name(path)?;
+    let f = zip.by_name(path)?;
+    read_limited(f, path, max_bytes)
+}
+
+/// 带上限读取（read_zip_limited 的精确名/解码名两条路径共用）
+fn read_limited(f: impl std::io::Read, label: &str, max_bytes: u64) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    std::io::Read::take(&mut f, max_bytes + 1).read_to_end(&mut buf)?;
+    std::io::Read::take(f, max_bytes + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > max_bytes {
         anyhow::bail!(
-            "条目 [{path}] 解压后超出大小上限（{}MB），已拒绝",
+            "条目 [{label}] 解压后超出大小上限（{}MB），已拒绝",
             max_bytes / 1024 / 1024
         );
     }

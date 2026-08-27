@@ -97,8 +97,13 @@ fn generate(src: &std::path::Path, cache: &std::path::Path) -> Option<Vec<u8>> {
     if let Some(parent) = cache.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // 写失败只是下次再生成一遍，不影响本次返回
-    let _ = std::fs::write(cache, &jpg);
+    // 原子落盘：先写临时文件再 rename——直接 write 的话，并发的另一请求可能在
+    // 半截文件上通过 mtime 校验，把截断的 JPEG 当缓存端出去（书架出现裂图）。
+    // 写失败只是下次再生成一遍，不影响本次返回。
+    let tmp = cache.with_extension(format!("tmp{}", std::process::id()));
+    if std::fs::write(&tmp, &jpg).is_ok() {
+        let _ = std::fs::rename(&tmp, cache);
+    }
     Some(jpg)
 }
 

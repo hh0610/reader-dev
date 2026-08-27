@@ -737,6 +737,35 @@ fn normalize_path(p: &str) -> String {
 /// rsync 更是先写 `.tmp` 再改名，根本不会被中途看到。
 ///
 /// 返回 false 表示文件在等待期间消失（调用方应跳过）。
+/// 单次观测的判定（纯函数，便于测试）：
+/// - `Some(true)`  已写完，可导入
+/// - `Some(false)` 直接跳过（0 字节占位文件）
+/// - `None`        继续轮询
+///
+/// mtime 可能在**未来**（NAS/FAT/网盘挂载的时钟偏移）——此时「距今静默 ≥ 阈值」
+/// 永远达不到，若不单独处理，每轮对账会对这种文件白等满 SETTLE_MAX_WAIT。
+/// 未来 mtime 退化为纯稳定性判定：连续两次观测 (size, mtime) 不变即认为写完
+/// （正在写入的文件两次观测必有变化，仍然挡得住）。
+fn settle_check(size: u64, mtime: i64, now: i64, quiet_ms: i64, last: Option<(u64, i64)>) -> Option<bool> {
+    let age = now.saturating_sub(mtime);
+    let quiet = age >= quiet_ms;
+    let future_skew = age < 0;
+    if quiet || future_skew {
+        // 已静默且是 0 字节 → 不是书，直接跳过。
+        // （早期实现在这里继续轮询，结果书仓里一个残留的空文件就能让每一轮对账
+        //   白等满 SETTLE_MAX_WAIT。文件后续若长出内容，mtime 变化会再触发事件。）
+        if size == 0 {
+            return Some(false);
+        }
+        // 正常静默：首次观测即放行（存量文件零等待）。
+        // 未来 mtime：必须等到第二次观测确认稳定（多花一个轮询间隔，换掉 60s 的呆等）。
+        if (quiet && last.is_none()) || last == Some((size, mtime)) {
+            return Some(true);
+        }
+    }
+    None
+}
+
 async fn wait_until_settled(path: &Path, quiet_ms: i64) -> bool {
     let start = Instant::now();
     let mut last: Option<(u64, i64)> = None;
@@ -746,17 +775,9 @@ async fn wait_until_settled(path: &Path, quiet_ms: i64) -> bool {
         };
         let size = meta.len();
         let mtime = file_mtime_ms(&meta);
-        let quiet = now_ms().saturating_sub(mtime) >= quiet_ms;
-        if quiet {
-            // 已静默且是 0 字节 → 不是书，直接跳过。
-            // （早期实现在这里继续轮询，结果书仓里一个残留的空文件就能让**每一轮对账**
-            //   白等满 SETTLE_MAX_WAIT。文件后续若长出内容，mtime 变化会再触发事件。）
-            if size == 0 {
-                return false;
-            }
-            if last.is_none() || last == Some((size, mtime)) {
-                return true;
-            }
+        match settle_check(size, mtime, now_ms(), quiet_ms, last) {
+            Some(v) => return v,
+            None => {}
         }
         if start.elapsed() >= SETTLE_MAX_WAIT {
             tracing::warn!(
@@ -920,6 +941,34 @@ mod tests {
             .contains("author"));
 
         cleanup(storage, "metalock").await;
+    }
+
+    /// settle_check 纯函数：正常静默 / 未来 mtime（NAS 时钟偏移）/ 空文件 三类路径
+    #[test]
+    fn 写入完成判定_含未来mtime() {
+        let now = 1_000_000i64;
+        let q = 3_000i64;
+        // 正常静默 + 首次观测 → 立即放行（存量文件零等待）
+        assert_eq!(settle_check(100, now - 10_000, now, q, None), Some(true));
+        // 刚写过（未静默）→ 继续轮询
+        assert_eq!(settle_check(100, now - 100, now, q, None), None);
+        // 静默的空文件 → 跳过
+        assert_eq!(settle_check(0, now - 10_000, now, q, None), Some(false));
+
+        // 未来 mtime（时钟偏移的挂载盘）：
+        let future = now + 3_600_000;
+        // 首次观测不放行（还不知道稳不稳定），但也**不该陷入 60s 呆等**
+        assert_eq!(settle_check(100, future, now, q, None), None);
+        // 第二次观测 (size, mtime) 未变 → 放行
+        assert_eq!(
+            settle_check(100, future, now, q, Some((100, future))),
+            Some(true),
+            "未来 mtime 应退化为稳定性判定，而不是等 age>=阈值（那永远等不到）"
+        );
+        // 第二次观测变了（正在写入）→ 继续轮询
+        assert_eq!(settle_check(200, future + 10, now, q, Some((100, future))), None);
+        // 未来 mtime 的空文件 → 同样直接跳过，不等满超时
+        assert_eq!(settle_check(0, future, now, q, None), Some(false));
     }
 
     /// 写入完成检测：正在写的文件要等，写完的立刻放行，等待中消失的返回 false
