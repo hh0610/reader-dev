@@ -10311,6 +10311,8 @@ async fn scan_local_book_dir(
     let user_rules = txt_toc_rule_regexes(&state, &namespace).await;
     let mut imported = 0usize;
     let mut failed = 0usize;
+    let mut skipped = 0usize;
+    let mut relinked = 0usize;
     let mut errors: Vec<serde_json::Value> = Vec::new();
     for target in targets {
         crate::service::fs_rate::tick().await;
@@ -10323,6 +10325,62 @@ async fn scan_local_book_dir(
             .unwrap_or_else(|_| target.clone())
             .to_string_lossy()
             .into_owned();
+        let file_mtime = target
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let file_size = target.metadata().map(|m| m.len() as i64).unwrap_or(0);
+
+        // 内容指纹去重（借鉴 booklore；只读 12KB，比解析整本便宜得多，故放在解析前）。
+        // 本 handler 原本按绝对路径去重，同一份文件换个路径就会再导一本；
+        // 而文件被移动/改名时，旧书还留在架上指向已消失的路径，等于凭空多出一本坏书。
+        let fingerprint = crate::service::file_fingerprint::fingerprint_file(&target).ok();
+        let mut dup_handled = false;
+        if let Some(fp) = fingerprint.as_deref() {
+            if let Ok(Some(existing)) = state.storage.find_book_by_file_hash(&namespace, fp).await {
+                let same_path = existing
+                    .local_file
+                    .as_deref()
+                    .map(|p| p == abs)
+                    .unwrap_or(false);
+                if !same_path {
+                    let old_exists = existing
+                        .local_file
+                        .as_deref()
+                        .map(|p| std::path::Path::new(p).exists())
+                        .unwrap_or(false);
+                    if old_exists {
+                        // 两处各有一份同内容文件 → 真重复，跳过
+                        skipped += 1;
+                    } else {
+                        // 旧路径已不存在 → 判定为移动/改名：把原书指向新路径，而不是新建一本
+                        if let Err(e) = state
+                            .storage
+                            .link_local_file(
+                                &namespace,
+                                &existing.book_url,
+                                Some(&abs),
+                                file_mtime,
+                                file_size,
+                                false,
+                            )
+                            .await
+                        {
+                            tracing::warn!("scanLocalBookDir 移动重定向失败 [{file_name}]: {e}");
+                        }
+                        relinked += 1;
+                    }
+                    dup_handled = true;
+                }
+            }
+        }
+        if dup_handled {
+            continue;
+        }
+
         let imported_book = match crate::service::local_book::parse_loc_book_path(
             &target,
             &user_rules,
@@ -10372,20 +10430,21 @@ async fn scan_local_book_dir(
             errors.push(json!({ "name": file_name, "error": format!("入库失败：{e}") }));
             continue;
         }
-        let mtime = target
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let size = target.metadata().map(|m| m.len() as i64).unwrap_or(0);
         if let Err(e) = state
             .storage
-            .link_local_file(&namespace, &book_url, Some(&abs), mtime, size, false)
+            .link_local_file(&namespace, &book_url, Some(&abs), file_mtime, file_size, false)
             .await
         {
             tracing::warn!("scanLocalBookDir 文件关联失败 [{}]: {e}", file_name);
+        }
+        if let Some(fp) = fingerprint.as_deref() {
+            if let Err(e) = state
+                .storage
+                .set_book_file_hash(&namespace, &book_url, fp)
+                .await
+            {
+                tracing::warn!("scanLocalBookDir 指纹落库失败 [{}]: {e}", file_name);
+            }
         }
         if let Some(cover) = &imported_book.cover {
             let cover_dir = state
@@ -10419,7 +10478,10 @@ async fn scan_local_book_dir(
     Json(ReturnData::ok(json!({
         "imported": imported,
         "failed": failed,
-        "total": imported + failed,
+        // skipped：内容与已有书重复；relinked：识别为文件移动/改名，已把原书指向新路径
+        "skipped": skipped,
+        "relinked": relinked,
+        "total": imported + failed + skipped + relinked,
         "errors": errors,
     })))
 }
@@ -10474,6 +10536,31 @@ async fn upload_local_book(
         return Json(ReturnData::err(
             "仅支持 EPUB/TXT/MOBI/AZW3/PDF/FB2/DOCX/ZIP(含OPF)/CBZ/UMD",
         ));
+    }
+
+    // 导入去重（借鉴 booklore FileFingerprint）：同一文件重复上传此前会生成多本同名书，
+    // 书架里堆一排一模一样的条目。指纹只读 12KB，比解析整本便宜得多，故放在解析之前。
+    // force=1 显式绕过——解析器修好后用户想重导一次是合理需求。
+    let file_hash = crate::service::file_fingerprint::fingerprint_bytes(&bytes);
+    let force = params
+        .get("force")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !force {
+        if let Ok(Some(existing)) = state
+            .storage
+            .find_book_by_file_hash(&namespace, &file_hash)
+            .await
+        {
+            tracing::info!(
+                "本地书去重命中 [{namespace}]：{} 与已有《{}》同指纹，跳过重复导入",
+                file_name,
+                existing.name
+            );
+            return Json(ReturnData::ok(
+                book_json_with_group_ids(&existing),
+            ));
+        }
     }
     // 用户自定义 TXT 目录规则（启用 + 按 serialNumber 排序）；无则用内置默认规则（仅 TXT 使用）
     let user_rules = txt_toc_rule_regexes(&state, &namespace).await;
@@ -10536,6 +10623,14 @@ async fn upload_local_book(
     {
         tracing::error!("本地书入库失败: {e}");
         return Json(ReturnData::err("入库失败"));
+    }
+    // 指纹落库供下次去重；写失败只是下次少一次命中，不该让导入整体失败
+    if let Err(e) = state
+        .storage
+        .set_book_file_hash(&namespace, &book_url, &file_hash)
+        .await
+    {
+        tracing::warn!("本地书指纹落库失败（不影响本次导入）: {e}");
     }
 
     // OPDS 原文件下载：原始文件落盘 data/{ns}/opds_files/{uuid}.{ext}（供 /opds/download 直下）
@@ -18597,6 +18692,75 @@ mod tests {
         cleanup(state, dir).await;
     }
 
+    /// scanLocalBookDir：内容指纹去重（同文件换路径不再重复导入）+ 移动识别（旧路径消失 → 重定向）
+    #[tokio::test]
+    async fn test_scan_local_book_dir_dedupe_and_relink() {
+        let (state, dir) = test_state("scandedupe").await;
+        let store_dir = state.storage.config.storage_dir().join("localStore");
+        let root = store_dir.join("books");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let content = "第一章 起点\n内容一。\n第二章 成长\n内容二。";
+        std::fs::write(root.join("原书.txt"), content).unwrap();
+
+        let scan = |state: AppState| async move {
+            let body = Bytes::from(r#"{"path":"/books","home":"__LOCAL_STORE__","recursive":true}"#);
+            scan_local_book_dir(
+                AxumState(state),
+                Query(HashMap::new()),
+                HeaderMap::new(),
+                Some(body),
+            )
+            .await
+        };
+
+        // ① 首扫导入 1 本
+        let ret = scan(state.clone()).await;
+        assert_eq!(ret.0.data["imported"], 1, "{:?}", ret.0.data);
+        let first = state
+            .storage
+            .list_books("default")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|b| b.book_url.starts_with("local://store/"))
+            .unwrap();
+
+        // ② 复制一份到子目录 → 内容相同、路径不同：应跳过而不是导第二本
+        std::fs::write(root.join("sub").join("副本.txt"), content).unwrap();
+        let ret = scan(state.clone()).await;
+        assert_eq!(ret.0.data["skipped"], 1, "同内容不同路径应计入 skipped: {:?}", ret.0.data);
+        // 原文件本身仍在原路径上 → 按既有语义正常重扫更新（幂等，不产生新书）
+        assert_eq!(ret.0.data["imported"], 1, "原文件应正常重扫更新: {:?}", ret.0.data);
+        let n = state
+            .storage
+            .list_books("default")
+            .await
+            .unwrap()
+            .iter()
+            .filter(|b| b.book_url.starts_with("local://store/"))
+            .count();
+        assert_eq!(n, 1, "书架仍应只有 1 本，实际 {n}");
+
+        // ③ 把原文件移走（旧路径消失，只剩子目录那份）→ 识别为移动，原书重定向到新路径
+        std::fs::remove_file(root.join("原书.txt")).unwrap();
+        let ret = scan(state.clone()).await;
+        assert_eq!(ret.0.data["relinked"], 1, "旧路径消失应判定为移动: {:?}", ret.0.data);
+        assert_eq!(ret.0.data["imported"], 0, "移动不应产生新书");
+        let after = state
+            .storage
+            .find_book("default", &first.book_url)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            after.local_file.as_deref().unwrap_or("").ends_with("副本.txt"),
+            "原书应指向移动后的新路径，实际 {:?}",
+            after.local_file
+        );
+
+        cleanup(state, dir).await;
+    }
+
     /// scanLocalBookDir：书仓目录已有书籍直接导入书架（无需上传）；重复扫描幂等
     #[tokio::test]
     async fn test_scan_local_book_dir_api() {
@@ -21837,6 +22001,92 @@ mod tests {
         )
         .await;
         assert!(!ret.0.is_success, "提取不到图片应报错");
+
+        cleanup(state, dir).await;
+    }
+
+    /// 端到端：uploadLocalBook 同文件重复上传去重（借鉴 booklore 稀疏指纹）
+    #[tokio::test]
+    async fn test_upload_local_book_dedupe_by_fingerprint() {
+        use tower::ServiceExt as _;
+        let (state, dir) = test_state("updedupe").await;
+        let app = axum::Router::new()
+            .route("/reader3/uploadLocalBook", post(upload_local_book))
+            .with_state(state.clone());
+
+        let multipart = |file_name: &str, bytes: &[u8]| {
+            let boundary = "----reader-upload-dedupe";
+            let mut mp: Vec<u8> = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .into_bytes();
+            mp.extend_from_slice(bytes);
+            mp.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            (mp, format!("multipart/form-data; boundary={boundary}"))
+        };
+        let post_txt = |uri: &'static str, name: &'static str, body: Vec<u8>| {
+            let app = app.clone();
+            async move {
+                let (mp, ct) = multipart(name, &body);
+                let resp = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("content-type", ct)
+                            .body(axum::body::Body::from(mp))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let b = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(&b).unwrap()
+            }
+        };
+
+        let txt = "第一章 起\n正文内容甲\n第二章 承\n正文内容乙\n"
+            .as_bytes()
+            .to_vec();
+
+        // ① 首次导入
+        let a = post_txt("/reader3/uploadLocalBook", "书.txt", txt.clone()).await;
+        assert!(a["isSuccess"].as_bool().unwrap(), "首次导入应成功: {a}");
+        let url_a = a["data"]["bookUrl"].as_str().unwrap().to_string();
+
+        // ② 同一文件再传一次（甚至换个文件名）→ 命中指纹，返回原书而不是新建一本
+        let b = post_txt("/reader3/uploadLocalBook", "书-副本.txt", txt.clone()).await;
+        assert!(b["isSuccess"].as_bool().unwrap(), "重复导入应成功返回原书: {b}");
+        assert_eq!(
+            b["data"]["bookUrl"].as_str().unwrap(),
+            url_a,
+            "同一文件重复上传必须复用原书，否则书架会堆一排一模一样的条目"
+        );
+        let shelf = state.storage.list_books("default").await.unwrap();
+        assert_eq!(shelf.len(), 1, "书架只应有 1 本，实际 {}", shelf.len());
+
+        // ③ 内容不同 → 正常新建
+        let mut other = txt.clone();
+        other.extend_from_slice("第三章 转\n正文内容丙\n".as_bytes());
+        let c = post_txt("/reader3/uploadLocalBook", "另一本.txt", other).await;
+        assert!(c["isSuccess"].as_bool().unwrap(), "不同文件应新建: {c}");
+        assert_ne!(
+            c["data"]["bookUrl"].as_str().unwrap(),
+            url_a,
+            "内容不同（仅追加一段）必须视为另一本——指纹带长度前缀正是为此"
+        );
+        assert_eq!(state.storage.list_books("default").await.unwrap().len(), 2);
+
+        // ④ 删书后重传同文件 → 行连同指纹一并消失，应重新导入（而不是被「已存在」挡住）
+        state.storage.delete_book("default", &url_a).await.unwrap();
+        let d = post_txt("/reader3/uploadLocalBook", "书.txt", txt).await;
+        assert!(d["isSuccess"].as_bool().unwrap(), "删书后应能重新导入: {d}");
+        assert_ne!(
+            d["data"]["bookUrl"].as_str().unwrap(),
+            url_a,
+            "删掉的书重传应是新的一本"
+        );
 
         cleanup(state, dir).await;
     }

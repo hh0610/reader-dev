@@ -760,6 +760,9 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     ensure_column_typed(&pool, "books", "local_file_mtime", "INTEGER DEFAULT 0").await?;
     ensure_column_typed(&pool, "books", "local_file_size", "INTEGER DEFAULT 0").await?;
     ensure_column_typed(&pool, "books", "local_file_deleted", "INTEGER DEFAULT 0").await?;
+    // 导入去重：原始文件的稀疏采样指纹（见 service::file_fingerprint）。
+    // 旧库为 NULL——不回填，只影响「这本是否能被后续同文件命中」，重导一次即补上。
+    ensure_column_typed(&pool, "books", "file_hash", "TEXT").await?;
 
     // P0 跨用户缓存隔离：book_chapters / toc_cache 补 user_namespace 列（旧库 ALTER，新库建表已含）
     ensure_column_typed(
@@ -2339,6 +2342,33 @@ impl Storage {
         .fetch_optional(&self.pool)
         .await?;
         Ok(book)
+    }
+
+    /// 按文件指纹查已导入的本地书（导入去重；见 service::file_fingerprint）。
+    /// 只在同一命名空间内查——A 用户导入过的文件不该影响 B 用户的导入。
+    pub async fn find_book_by_file_hash(&self, ns: &str, file_hash: &str) -> Result<Option<Book>> {
+        if file_hash.is_empty() {
+            return Ok(None);
+        }
+        let book = sqlx::query_as::<_, Book>(
+            "SELECT * FROM books WHERE user_namespace = ?1 AND file_hash = ?2 ORDER BY rowid LIMIT 1",
+        )
+        .bind(ns)
+        .bind(file_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(book)
+    }
+
+    /// 记录本地书原始文件指纹（导入后调用；失败不影响导入本身）
+    pub async fn set_book_file_hash(&self, ns: &str, book_url: &str, file_hash: &str) -> Result<()> {
+        sqlx::query("UPDATE books SET file_hash = ?3 WHERE user_namespace = ?1 AND book_url = ?2")
+            .bind(ns)
+            .bind(book_url)
+            .bind(file_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// 按 书名+作者 查书架书（legacy saveBookToShelf 判重键——同书不同 URL 视为同一本）
