@@ -385,8 +385,10 @@ pub fn voice_locale(voice: &str) -> &str {
 }
 
 /// 构造 SSML 合成请求消息（Path:ssml）
-/// `volume`：prosody volume（默认 +0%）；`style`：mstts express-as 风格（仅 Azure/Edge 支持，
-/// 非空时输出 `<mstts:express-as>` 包裹，legacy SSML 语义对齐）
+/// `volume`：prosody volume（默认 +0%）；`style` 参数**被忽略**——
+/// mstts express-as 风格是 Azure 付费端点的能力，Edge 免费 readaloud 端点不支持：
+/// SSML 里带 `<mstts:express-as>` 时微软**静默不返回任何音频帧**（实测：带 style 100% 失败、
+/// 去掉即成功；官方 edge-tts 的 mkssml 也从不输出该标签）。保留参数只为兼容既有调用方签名。
 pub fn build_ssml(
     text: &str,
     voice: &str,
@@ -404,13 +406,10 @@ pub fn build_ssml(
     } else {
         volume.trim()
     };
-    let (style_open, style_close) = match style.filter(|s| !s.trim().is_empty()) {
-        Some(s) => (
-            format!("<mstts:express-as style='{}'>", xml_escape(s.trim())),
-            "</mstts:express-as>".to_string(),
-        ),
-        None => (String::new(), String::new()),
-    };
+    if let Some(st) = style.filter(|s| !s.trim().is_empty()) {
+        tracing::debug!("Edge TTS 不支持朗读风格，已忽略 style={st}（免费端点带 express-as 会静默无音频）");
+    }
+    let (style_open, style_close) = (String::new(), String::new());
     let ssml = format!(
         "<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' \
          xmlns:mstts='https://www.w3.org/2001/mstts' xml:lang='{locale}'>\
@@ -927,7 +926,9 @@ mod tests {
         let ssml_en = build_ssml("hello", "en-US-JennyNeural", "+0%", "+0Hz", "+5%", None);
         assert!(ssml_en.contains("xml:lang='en-US'"));
         assert!(ssml_en.contains("volume='+5%'"));
-        // express-as style（legacy Azure 语义）
+        // style 必须被忽略：免费 readaloud 端点带 <mstts:express-as> 会**静默无音频**
+        // （实测带 style 100% 失败；官方 edge-tts 的 mkssml 也从不输出该标签）。
+        // 早期版本会输出该标签——用户在面板选任意风格即整章「合成失败」。
         let ssml_style = build_ssml(
             "hi",
             "zh-CN-XiaoxiaoNeural",
@@ -936,8 +937,11 @@ mod tests {
             "+0%",
             Some("cheerful"),
         );
-        assert!(ssml_style.contains("<mstts:express-as style='cheerful'>"));
-        assert!(ssml_style.contains("</mstts:express-as>"));
+        assert!(
+            !ssml_style.contains("express-as"),
+            "style 不得进入 SSML：{ssml_style}"
+        );
+        assert!(ssml_style.contains("hi</prosody>"), "正文仍应正常包裹");
     }
 
     /// 非法 XML 字符剥离 + 转义（0x7F 属 XML 1.0 合法范围，保留）

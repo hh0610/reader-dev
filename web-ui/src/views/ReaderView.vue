@@ -1760,7 +1760,9 @@ let ttsAutoNext = false
   ttsRate.value = round1(loadSetting(TTS_RATE_KEY, 0.5, 2, 1, 0.1))
   ttsPitch.value = loadSetting(TTS_PITCH_KEY, -10, 10, 0)
   ttsVolume.value = loadSetting(TTS_VOLUME_KEY, 0, 200, 100)
-  ttsStyle.value = localStorage.getItem(TTS_STYLE_KEY) ?? ''
+  // 风格选项已移除（Edge 免费端点不支持 express-as，选了会导致整章无音频）；
+  // 存量 localStorage 值清空，后端亦已忽略该参数（双保险）
+  ttsStyle.value = ''
   const e = localStorage.getItem(TTS_ENGINE_KEY)
   if (e === 'edge' || e === 'http') ttsEngine.value = e
   ttsHttpName.value = localStorage.getItem(TTS_HTTP_NAME_KEY) ?? ''
@@ -5616,26 +5618,6 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <div v-if="ttsEngine === 'edge'" class="set-row">
-            <span class="set-label">风格</span>
-            <select v-model="ttsStyle" class="tts-select">
-              <option value="">无</option>
-              <option value="cheerful">开心</option>
-              <option value="sad">悲伤</option>
-              <option value="angry">生气</option>
-              <option value="fearful">害怕</option>
-              <option value="excited">兴奋</option>
-              <option value="friendly">友好</option>
-              <option value="gentle">温柔</option>
-              <option value="hopeful">希望</option>
-              <option value="lyrical">抒情</option>
-              <option value="newscast">新闻</option>
-              <option value="poetry-reading">朗读</option>
-              <option value="serious">严肃</option>
-              <option value="shouting">呼喊</option>
-              <option value="whispering">耳语</option>
-            </select>
-          </div>
 
           <div class="tts-controls">
             <button
