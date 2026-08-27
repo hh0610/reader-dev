@@ -1526,13 +1526,32 @@ pub async fn acquire(storage: &Storage, ns: &str, book_id: &str) -> Result<(Stri
 /// 下载（返回 (文件名, 字节, Content-Type)）：
 /// - 本地书：原文件字节（txt/epub/zip）；format=txt 且原文件为 EPUB 时正文拼接
 /// - 书源书：目录 + 正文拼接 TXT（限 max_chapters 防超时）
+/// 下载载荷：磁盘原文件走 Range 流式发送（不进内存），现场拼接的内容才带字节。
+pub enum DownloadPayload {
+    /// 本地书原文件路径——由 api::range::serve_file 流式发送并支持断点续传
+    File(PathBuf),
+    /// 现场生成的内容（章节拼接 txt 等），本就在内存里
+    Bytes(Vec<u8>),
+}
+
+impl DownloadPayload {
+    /// 测试与旧调用方便用：取出字节（File 分支现读）
+    #[cfg(test)]
+    pub fn into_bytes(self) -> std::io::Result<Vec<u8>> {
+        match self {
+            DownloadPayload::File(p) => std::fs::read(p),
+            DownloadPayload::Bytes(b) => Ok(b),
+        }
+    }
+}
+
 pub async fn download(
     storage: &Storage,
     ns: &str,
     book_id: &str,
     format: &str,
     max_chapters: Option<usize>,
-) -> Result<(String, Vec<u8>, String)> {
+) -> Result<(String, DownloadPayload, String)> {
     let book = find_book(storage, ns, book_id).await?;
 
     if is_local_book(&book.book_url, &book.origin) {
@@ -1553,17 +1572,17 @@ pub async fn download(
                     .join("\n\n");
                 return Ok((
                     format!("{}.txt", book.name),
-                    txt.into_bytes(),
+                    DownloadPayload::Bytes(txt.into_bytes()),
                     "text/plain; charset=utf-8".to_string(),
                 ));
             }
-            let bytes = std::fs::read(&path)?;
             let name = path
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_else(|| format!("{}.{}", book.name, ext));
             let ct = content_type_for_ext(&ext).to_string();
-            return Ok((name, bytes, ct));
+            // 不再 std::fs::read 整本：500MB 的 PDF 曾是 500MB 常驻内存，且客户端无法断点续传
+            return Ok((name, DownloadPayload::File(path), ct));
         }
         // 无原文件（旧数据导入的 local:// 书）：章节拼接
         if book.book_url.starts_with("local://") {
@@ -1576,7 +1595,7 @@ pub async fn download(
             }
             return Ok((
                 format!("{}.txt", book.name),
-                txt.into_bytes(),
+                DownloadPayload::Bytes(txt.into_bytes()),
                 "text/plain; charset=utf-8".to_string(),
             ));
         }
@@ -1636,7 +1655,7 @@ pub async fn download(
     tracing::info!("OPDS 下载 [{ns}] {}：{count} 章", book.name);
     Ok((
         format!("{}.txt", book.name),
-        txt.into_bytes(),
+        DownloadPayload::Bytes(txt.into_bytes()),
         "text/plain; charset=utf-8".to_string(),
     ))
 }
@@ -2312,7 +2331,7 @@ mod tests {
             .unwrap();
         assert_eq!(name, "本地书.txt");
         assert_eq!(ct, "text/plain; charset=utf-8");
-        let txt = String::from_utf8(bytes).unwrap();
+        let txt = String::from_utf8(bytes.into_bytes().unwrap()).unwrap();
         assert!(txt.contains("正文一") && txt.contains("正文二"));
 
         // 落盘原文件（模拟上传时保存）→ 原样返回
@@ -2329,7 +2348,10 @@ mod tests {
             .unwrap();
         assert_eq!(name, "cccc.txt");
         assert_eq!(ct, "text/plain; charset=utf-8");
-        assert_eq!(String::from_utf8(bytes).unwrap(), "原始TXT内容");
+        assert_eq!(
+            String::from_utf8(bytes.into_bytes().unwrap()).unwrap(),
+            "原始TXT内容"
+        );
 
         // EPUB 原文件：application/epub+zip
         let epub_bytes = b"PK\x03\x04fake-epub".to_vec();
@@ -2338,7 +2360,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ct, "application/epub+zip");
-        assert_eq!(bytes, epub_bytes);
+        assert_eq!(bytes.into_bytes().unwrap(), epub_bytes);
         cleanup(storage, dir).await;
     }
 

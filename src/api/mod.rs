@@ -2,6 +2,7 @@
 
 pub mod files;
 pub mod opds;
+pub mod range;
 pub mod pro_export;
 pub mod router;
 pub mod webdav;

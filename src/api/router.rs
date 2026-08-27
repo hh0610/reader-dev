@@ -7473,15 +7473,32 @@ async fn opds_dispatch(
                 .get("maxChapters")
                 .and_then(|v| v.parse::<usize>().ok());
             match crate::api::opds::download(&state.storage, &ns, id, &format, max_chapters).await {
-                Ok((name, bytes, ct)) => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("Content-Type", ct)
-                    .header(
-                        "Content-Disposition",
-                        format!("attachment; filename=\"{}\"", name),
-                    )
-                    .body(Body::from(bytes))
-                    .unwrap(),
+                Ok((name, payload, ct)) => {
+                    let disposition = format!("attachment; filename=\"{}\"", name);
+                    match payload {
+                        // 原文件：流式 + Range（KOReader/下载器可断点续传，服务端不再整本进内存）
+                        crate::api::opds::DownloadPayload::File(path) => {
+                            match crate::api::range::serve_file(
+                                &path,
+                                &ct,
+                                &headers,
+                                &[("Content-Disposition", disposition)],
+                            )
+                            .await
+                            {
+                                Some(resp) => resp,
+                                None => opds_404(),
+                            }
+                        }
+                        // 现场拼接的内容本就在内存里，直接发；仍声明 Accept-Ranges 之外的语义不变
+                        crate::api::opds::DownloadPayload::Bytes(bytes) => Response::builder()
+                            .status(StatusCode::OK)
+                            .header("Content-Type", ct)
+                            .header("Content-Disposition", disposition)
+                            .body(Body::from(bytes))
+                            .unwrap(),
+                    }
+                }
                 Err(e) => {
                     tracing::warn!("OPDS 下载失败: {e}");
                     opds_404()
@@ -11408,16 +11425,33 @@ async fn serve_data_file(
     if !file_abs.starts_with(&root_abs) || !file_abs.is_file() {
         return webdav_status_404();
     }
-    let bytes = match tokio::fs::read(&file_abs).await {
-        Ok(b) => b,
-        Err(_) => return webdav_status_404(),
-    };
     let ext = file_abs
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
-    if matches!(ext.as_str(), "html" | "htm" | "xhtml") {
+    // 非 HTML 资源（图片/CSS/字体/音视频）：流式 + Range，不整份进内存。
+    // HTML 章节要注入 __API_ROOT__ 脚本，必须先读全再改写，故走下面的老路径。
+    if !matches!(ext.as_str(), "html" | "htm" | "xhtml") {
+        let ct = mime_for(&file_abs);
+        return match crate::api::range::serve_file(
+            &file_abs,
+            &ct,
+            headers,
+            // 书籍资源按 (命名空间, 文件名) 稳定：EPUB 重导会换 uuid 目录，故可放心长缓存
+            &[("Cache-Control", "private, max-age=86400".to_string())],
+        )
+        .await
+        {
+            Some(resp) => resp,
+            None => webdav_status_404(),
+        };
+    }
+    let bytes = match tokio::fs::read(&file_abs).await {
+        Ok(b) => b,
+        Err(_) => return webdav_status_404(),
+    };
+    {
         let html = String::from_utf8_lossy(&bytes);
         let injected = inject_api_root_script(&html, &request_base_url(headers));
         let mut builder = Response::builder()
@@ -11443,13 +11477,8 @@ async fn serve_data_file(
                 );
             }
         }
-        return builder.body(Body::from(injected)).unwrap();
+        builder.body(Body::from(injected)).unwrap()
     }
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", mime_for(&file_abs))
-        .body(Body::from(bytes))
-        .unwrap()
 }
 
 /// 静态资源鉴权 cookie 名（见 [`data_file_namespace_ok`]）
@@ -16506,7 +16535,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(fname, "本地书.txt");
-        let text = String::from_utf8(bytes).unwrap();
+        let text = String::from_utf8(bytes.into_bytes().unwrap()).unwrap();
         assert!(text.contains("第二段内容"));
 
         // 书架目录（OPDS 2.0 JSON）：含两个 acquisition 链接（download + acquire，绝对 URL）
@@ -23244,6 +23273,35 @@ mod tests {
         assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
         let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
         assert_eq!(&bytes[..], &[0x89u8, b'P', b'N', b'G']);
+
+        // ①b 静态资源支持 Range：客户端可只取需要的片段（pdf.js/下载器断点续传）
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/book-assets/alice/book-assets/main.css")
+                    .header("host", "srv.example:8080")
+                    .header("range", "bytes=5-9")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT, "应回 206");
+        assert_eq!(
+            resp.headers().get("content-range").unwrap(),
+            "bytes 5-9/18",
+            "Content-Range 必须带总长，客户端据此决定还要不要续拉"
+        );
+        let part = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&part[..], b"{ mar", "206 只回该区间");
+        // 无 Range 时也要声明 Accept-Ranges，否则客户端根本不会尝试分段
+        let resp = app
+            .clone()
+            .oneshot(req("/book-assets/alice/book-assets/main.css".into()))
+            .await
+            .unwrap();
+        assert_eq!(resp.headers().get("accept-ranges").unwrap(), "bytes");
 
         // ② epub 章节 HTML：中文段 percent-encoded；</BODY> 大写也注入其前；base 取 Host 头
         let seg = urlencoding::encode("测试书_作者A");
