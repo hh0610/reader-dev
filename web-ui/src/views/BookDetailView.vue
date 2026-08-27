@@ -656,10 +656,11 @@ async function switchSource(r: SearchBook) {
   if (!r.origin || r.origin === currentOrigin.value) return
   sourceSwitching.value = true
   try {
-    const nextBookUrl = r.bookUrl || b.bookUrl
-    const nextTocUrl = r.tocUrl || nextBookUrl
+    // bookUrl 保持书架主键不变（详情页/阅读器的进度、书签等都以它为键）；
+    // 新源的书籍地址存进 tocUrl
+    const nextTocUrl = r.tocUrl || r.bookUrl || b.bookUrl
     await saveBook({
-      bookUrl: nextBookUrl,
+      bookUrl: b.bookUrl,
       origin: r.origin,
       originName: r.originName,
       tocUrl: nextTocUrl,
@@ -668,7 +669,6 @@ async function switchSource(r: SearchBook) {
     b.origin = r.origin
     b.originName = r.originName
     b.tocUrl = nextTocUrl
-    b.bookUrl = nextBookUrl
     currentOrigin.value = r.origin
     info.value = null
     tocLoaded.value = false

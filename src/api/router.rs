@@ -7768,9 +7768,26 @@ async fn delete_book(
     if book_url.is_empty() {
         return Json(ReturnData::err("书架书籍不存在"));
     }
+    // 本地书：移出书架 = 连同**导入的副本文件**一起删除。
+    // 此前只删库记录、留下磁盘文件，后台同步扫到"孤立文件"又会自动导入回书架
+    // （用户实测："移出书架后再进来书又回来了"）。用户原始文件（如 ~/Downloads 里的）
+    // 不受影响——这里删的是导入时落在 storage/ 下的副本。
+    let local_file = state
+        .storage
+        .find_book(&namespace, &book_url)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|b| b.local_file.clone())
+        .filter(|p| !p.trim().is_empty());
     match state.storage.delete_book(&namespace, &book_url).await {
         Ok(0) => Json(ReturnData::err("书架书籍不存在")),
-        Ok(_) => Json(ReturnData::ok(serde_json::json!("删除书籍成功"))),
+        Ok(_) => {
+            if let Some(rel) = local_file {
+                delete_imported_copy(&state, &namespace, &rel).await;
+            }
+            Json(ReturnData::ok(serde_json::json!("删除书籍成功")))
+        }
         Err(e) => {
             tracing::error!("deleteBook 失败: {e}");
             Json(ReturnData::err("删除失败"))
@@ -10650,6 +10667,34 @@ fn is_loc_book_file_chapter(chapter_url: &str) -> bool {
     crate::service::local_book::SUPPORTED_EXTENSIONS
         .iter()
         .any(|e| lower.ends_with(&format!(".{e}")))
+}
+
+/// 删除本地书「导入时落盘的副本」（移出书架时调用）。
+///
+/// 安全：canonicalize 后必须仍位于 storage 根内才删——`local_file` 来自库记录，
+/// 不应能指向 storage 之外；越界或不存在则只记日志、不做任何删除。
+/// 用户的原始文件（导入来源，如 ~/Downloads）不在 storage 内，天然不受影响。
+async fn delete_imported_copy(state: &AppState, ns: &str, local_file: &str) {
+    let root = state.storage.config.storage_dir();
+    let p = std::path::Path::new(local_file);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        // 相对路径基于 storage 根（本地书导入时按 storage/ 相对路径记录）
+        root.join(local_file.trim_start_matches("storage/"))
+    };
+    let (Ok(root_abs), Ok(file_abs)) = (root.canonicalize(), abs.canonicalize()) else {
+        tracing::debug!("移出本地书：副本不存在或路径无法解析 [{local_file}]");
+        return;
+    };
+    if !file_abs.starts_with(&root_abs) || !file_abs.is_file() {
+        tracing::warn!("移出本地书：副本不在 storage 内，跳过删除 [{}]", file_abs.display());
+        return;
+    }
+    match tokio::fs::remove_file(&file_abs).await {
+        Ok(()) => tracing::info!("移出本地书 [{ns}]：已删除导入副本 {}", file_abs.display()),
+        Err(e) => tracing::warn!("移出本地书：删除副本失败 [{}]: {e}", file_abs.display()),
+    }
 }
 
 /// 本地书链接穿越检测：`storage/`-型 book_url 去前缀后若为绝对路径或含 `..` 段 → 拒绝。
@@ -23173,6 +23218,76 @@ mod tests {
         );
         let chapters = ret.0.data.as_array().cloned().unwrap_or_default();
         assert_eq!(chapters.len(), 2, "应取到 2 章: {:?}", ret.0.data);
+
+        cleanup(state, dir).await;
+    }
+
+    /// 移出本地书 = 连同导入副本一起删除（此前只删库记录，后台同步扫到孤立文件
+    /// 会把书自动加回书架——用户实测「移出后再进来书又回来了」）
+    #[tokio::test]
+    async fn test_delete_book_removes_imported_copy() {
+        let (state, dir) = test_state("delcopy").await;
+        let root = state.storage.config.storage_dir();
+        let books_dir = root.join("data").join("default");
+        std::fs::create_dir_all(&books_dir).unwrap();
+        let copy = books_dir.join("测试书.txt");
+        std::fs::write(&copy, "正文").unwrap();
+
+        // 入库一本关联该副本的本地书
+        let mut b = crate::model::Book {
+            book_url: "local://del-copy".into(),
+            name: "测试书".into(),
+            origin: "local".into(),
+            ..Default::default()
+        };
+        b.local_file = Some(copy.to_string_lossy().into_owned());
+        state.storage.upsert_book("default", &b).await.unwrap();
+        assert!(copy.exists(), "前置：副本应存在");
+
+        let mut params = HashMap::new();
+        params.insert("bookUrl".to_string(), "local://del-copy".to_string());
+        let ret = delete_book(
+            AxumState(state.clone()),
+            Query(params),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(ret.0.is_success, "删除应成功: {}", ret.0.error_msg);
+        assert!(!copy.exists(), "导入副本应被一并删除");
+
+        cleanup(state, dir).await;
+    }
+
+    /// 安全：local_file 指向 storage 之外时不得删除（防越界删用户文件）
+    #[tokio::test]
+    async fn test_delete_book_never_deletes_outside_storage() {
+        let (state, dir) = test_state("delcopy-guard").await;
+        // 造一个 storage 之外的文件
+        let outside = std::env::temp_dir().join(format!("reader-outside-{}.txt", std::process::id()));
+        std::fs::write(&outside, "用户的重要文件").unwrap();
+
+        let mut b = crate::model::Book {
+            book_url: "local://guard".into(),
+            name: "越界书".into(),
+            origin: "local".into(),
+            ..Default::default()
+        };
+        b.local_file = Some(outside.to_string_lossy().into_owned());
+        state.storage.upsert_book("default", &b).await.unwrap();
+
+        let mut params = HashMap::new();
+        params.insert("bookUrl".to_string(), "local://guard".to_string());
+        let ret = delete_book(
+            AxumState(state.clone()),
+            Query(params),
+            HeaderMap::new(),
+            None,
+        )
+        .await;
+        assert!(ret.0.is_success);
+        assert!(outside.exists(), "storage 之外的文件绝不能被删除");
+        let _ = std::fs::remove_file(&outside);
 
         cleanup(state, dir).await;
     }

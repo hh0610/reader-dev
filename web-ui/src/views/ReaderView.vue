@@ -3317,10 +3317,12 @@ async function switchSource(r: SearchBook) {
     const toc = tocRes.data
     // 目录确认可用后再落库：bookUrl 也要切到候选源的（否则 origin 与 bookUrl 分属两源）
     if (!isTemp) {
-      // 必须带上书名/作者等身份字段：saveBook 在 bookUrl 变化时按「新书」全量写入，
-      // 不传 name 会把书名清空 → 之后换源报「无法获取书名」（换源需靠书名搜索）
+      // bookUrl **保持不变**（书架主键）：阅读器内进度/书签等一律用路由里的 bookUrl，
+      // 换源若改主键，这些请求会指向已不存在的旧 URL → 「书籍未加入书架」。
+      // 新源的书籍地址存进 tocUrl（后端取目录/正文以 tocUrl + origin 为准）。
+      // 同时带上书名等身份字段，避免被当新书写入时清空。
       await saveBook({
-        bookUrl: r.bookUrl || b.bookUrl,
+        bookUrl: b.bookUrl,
         origin: r.origin,
         originName: r.originName,
         tocUrl: nextTocUrl,
@@ -3334,7 +3336,6 @@ async function switchSource(r: SearchBook) {
     b.origin = r.origin
     b.originName = r.originName
     b.tocUrl = nextTocUrl
-    if (r.bookUrl) b.bookUrl = r.bookUrl
     let startIdx = relocateChapterIndex(oldIdx, oldTitle, toc)
     if (startIdx < 0) startIdx = toc.findIndex((c) => !c.isVolume)
     if (startIdx < 0) startIdx = 0
