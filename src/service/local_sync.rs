@@ -403,18 +403,21 @@ async fn import_file(
     }
     crate::service::fs_rate::tick().await;
     let bytes = std::fs::read(path)?;
-    let imported = local_book::parse_file_bytes(
+    // book_url 提前生成：正文里的图片写成资源端点地址（按需从原压缩包取，不内联 base64）
+    let book_url = format!("local://{}", uuid::Uuid::new_v4());
+    let asset_base = crate::api::book_asset::asset_base_for(&book_url);
+    let imported = local_book::parse_file_bytes_with_assets(
         &bytes,
         &ext,
         user_rules,
         local_book::DEFAULT_EPUB_TOC_MODE,
         false,
+        Some(&asset_base),
     )
     .map_err(|e| anyhow::anyhow!("解析失败: {e:#}"))?;
     if imported.chapters.is_empty() {
         anyhow::bail!("未解析到章节内容");
     }
-    let book_url = format!("local://{}", uuid::Uuid::new_v4());
     let name = if imported.meta.title.is_empty() {
         path.file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -475,9 +478,16 @@ async fn reparse_and_update(
     let ext = local_book::file_ext(&path.to_string_lossy());
     crate::service::fs_rate::tick().await;
     let bytes = std::fs::read(path)?;
-    let imported: ImportedBook =
-        local_book::parse_file_bytes(&bytes, &ext, &[], &book.toc_url, book.split_long_chapter)
-            .map_err(|e| anyhow::anyhow!("解析失败: {e:#}"))?;
+    let asset_base = crate::api::book_asset::asset_base_for(&book.book_url);
+    let imported: ImportedBook = local_book::parse_file_bytes_with_assets(
+        &bytes,
+        &ext,
+        &[],
+        &book.toc_url,
+        book.split_long_chapter,
+        Some(&asset_base),
+    )
+    .map_err(|e| anyhow::anyhow!("解析失败: {e:#}"))?;
     if imported.chapters.is_empty() {
         anyhow::bail!("未解析到章节内容");
     }

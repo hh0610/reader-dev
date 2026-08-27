@@ -88,6 +88,8 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         // storage/data/ 为 Web 根：EPUB 解压资源/章节 HTML 直读；HTML 响应在 </body>
         // 前注入 __API_ROOT__ 脚本，见 serve_data_file）
         .route("/book-assets/*rest", get(book_assets))
+        // 本地书压缩包内资源按需取用（正文图片不再内联 base64，见 api::book_asset）
+        .route("/book-asset", get(crate::api::book_asset::book_asset))
         .route("/epub/*rest", get(epub_asset))
         .route("/health", get(health))
         // Kindle 轻量页（/simple/*：web-simple/ 纯静态——目录请求自动 index.html；
@@ -377,7 +379,7 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/reader3/getBookToc", get(get_book_toc).post(get_book_toc))
         .route(
             "/reader3/getBookContent",
-            get(get_book_content).post(get_book_content),
+            get(get_book_content_route).post(get_book_content_route),
         )
         // 差距补全批：多格式导出 / 书源调试 / 整书缓存 / 用户配置 / 本地书刷新 / 批量接口 / 书源健康 / 阅读统计
         .route("/reader3/exportBook", get(export_book).post(export_book))
@@ -3760,6 +3762,39 @@ async fn bump_source_use(state: &AppState, ns: &str, source: &crate::model::Book
     {
         tracing::debug!("书源使用计数失败 [{}]: {e}", source.book_source_name);
     }
+}
+
+/// HTTP 路由包装：调 [`get_book_content`]，并在 secure 模式下顺带下发
+/// `/book-asset` 路径限定的鉴权 cookie。
+///
+/// 为什么放在这里而不是 handler 内部：正文里的图片现在是 `<img src="/book-asset?...">`，
+/// **浏览器发子请求不会带 Authorization 头**，只能靠 cookie。而取正文这一次请求
+/// 本身是带鉴权的，正好借它把 cookie 种下——这样前端一行都不用改。
+/// 包一层而不改 handler 签名，是为了不动它现有的十余处直接调用与测试。
+async fn get_book_content_route(
+    State(state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    body: Option<axum::body::Bytes>,
+) -> Response {
+    let secure = state.storage.config.secure;
+    let token = access_token_of(&params, &headers);
+    let ret = get_book_content(State(state), Query(params), headers, body).await;
+    let mut resp = ret.into_response();
+    if secure {
+        if let Some(tok) = token.filter(|t| !t.is_empty()) {
+            // HttpOnly + SameSite=Strict + Path 限定到资源端点；仅 GET 静态读，
+            // token 本就随 query 传递（OPDS 同样如此），CSRF 面可忽略。
+            if let Ok(v) = axum::http::HeaderValue::from_str(&format!(
+                "{}={tok}; Path=/book-asset; HttpOnly; SameSite=Strict; Max-Age=2592000",
+                crate::api::book_asset::ASSET_COOKIE
+            )) {
+                resp.headers_mut()
+                    .append(axum::http::header::SET_COOKIE, v);
+            }
+        }
+    }
+    resp
 }
 
 /// POST/GET /reader3/getBookContent：章节正文（ruleContent）
@@ -10398,11 +10433,20 @@ async fn scan_local_book_dir(
             continue;
         }
 
-        let imported_book = match crate::service::local_book::parse_loc_book_path(
+        // book_url 由绝对路径 hash 稳定得出，可在解析前算出，供资源端点地址使用
+        let scan_book_url = {
+            use sha2::Digest as _;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(abs.as_bytes());
+            format!("local://store/{:x}", hasher.finalize())
+        };
+        let scan_asset_base = crate::api::book_asset::asset_base_for(&scan_book_url);
+        let imported_book = match crate::service::local_book::parse_loc_book_path_with_assets(
             &target,
             &user_rules,
             crate::service::local_book::DEFAULT_EPUB_TOC_MODE,
             false,
+            Some(&scan_asset_base),
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -10416,11 +10460,7 @@ async fn scan_local_book_dir(
             errors.push(json!({ "name": file_name, "error": "未解析到章节内容" }));
             continue;
         }
-        use sha2::Digest as _;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(abs.as_bytes());
-        let id = format!("{:x}", hasher.finalize());
-        let book_url = format!("local://store/{id}");
+        let book_url = scan_book_url;
         let ext = crate::service::local_book::file_ext(&file_name);
         let (book_name, book_author) = local_book_display_meta(&file_name, &ext, &imported_book);
         let book = crate::model::book_chapter::BookInfo {
@@ -10568,6 +10608,9 @@ async fn upload_local_book(
     }
     // 用户自定义 TXT 目录规则（启用 + 按 serialNumber 排序）；无则用内置默认规则（仅 TXT 使用）
     let user_rules = txt_toc_rule_regexes(&state, &namespace).await;
+    // book_url 提前生成：资源端点地址要在解析时就写进正文（图片不再内联 base64）
+    let book_url = format!("local://{}", uuid::Uuid::new_v4());
+    let asset_base = crate::api::book_asset::asset_base_for(&book_url);
     let imported = if ext == "txt" {
         // TXT 解析失败保持静默回退（与旧行为一致：空书 → “未解析到章节内容”）
         crate::service::local_book::parse_txt_with_rules(&bytes, &user_rules).unwrap_or_else(|e| {
@@ -10580,12 +10623,13 @@ async fn upload_local_book(
             }
         })
     } else {
-        match crate::service::local_book::parse_file_bytes(
+        match crate::service::local_book::parse_file_bytes_with_assets(
             &bytes,
             &ext,
             &user_rules,
             crate::service::local_book::DEFAULT_EPUB_TOC_MODE,
             false,
+            Some(&asset_base),
         ) {
             Ok(b) => b,
             Err(e) => {
@@ -10601,7 +10645,6 @@ async fn upload_local_book(
         return Json(ReturnData::err("未解析到章节内容"));
     }
 
-    let book_url = format!("local://{}", uuid::Uuid::new_v4());
     let (book_name, book_author) = local_book_display_meta(&file_name, &ext, &imported);
     let book = crate::model::book_chapter::BookInfo {
         name: book_name,
@@ -11453,6 +11496,11 @@ async fn serve_data_file(
 
 /// 静态资源鉴权 cookie 名（见 [`data_file_namespace_ok`]）
 const ASSET_TOKEN_COOKIE: &str = "reader_asset_token";
+
+/// [`cookie_value`] 的对外包装（book_asset 端点鉴权回退用）
+pub fn cookie_value_pub(headers: &HeaderMap, name: &str) -> Option<String> {
+    cookie_value(headers, name)
+}
 
 /// 从 Cookie 头取指定 cookie 值
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -22004,6 +22052,127 @@ mod tests {
         cleanup(state, dir).await;
     }
 
+    /// 端到端：CBZ 上传后正文只存资源地址，图片经 /book-asset 按需取回
+    #[tokio::test]
+    async fn test_book_asset_endpoint_serves_images() {
+        use tower::ServiceExt as _;
+        let (state, dir) = test_state("bookasset").await;
+        let app = axum::Router::new()
+            .route("/reader3/uploadLocalBook", post(upload_local_book))
+            .route("/book-asset", get(crate::api::book_asset::book_asset))
+            .with_state(state.clone());
+
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        use std::io::Write as _;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("p01.png", opts).unwrap();
+            zip.write_all(png).unwrap();
+            zip.start_file("p02.png", opts).unwrap();
+            zip.write_all(png).unwrap();
+            zip.finish().unwrap();
+        }
+        let cbz = buf.into_inner();
+        let boundary = "----reader-asset-test";
+        let mut mp: Vec<u8> = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"漫画.cbz\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .into_bytes();
+        mp.extend_from_slice(&cbz);
+        mp.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/reader3/uploadLocalBook")
+                    .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+                    .body(Body::from(mp))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let b = axum::body::to_bytes(resp.into_body(), 8 * 1024 * 1024)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&b).unwrap();
+        assert!(json["isSuccess"].as_bool().unwrap(), "上传应成功: {json}");
+        let book_url = json["data"]["bookUrl"].as_str().unwrap().to_string();
+
+        // ① 正文只存地址，不再是几 MB 的 base64
+        let content = state
+            .storage
+            .get_chapter_content("default", &book_url, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !content.contains("base64,"),
+            "章节正文不应再内联 base64（这正是要省掉的开销）：{content}"
+        );
+        assert!(
+            content.contains("/book-asset?url="),
+            "章节正文应写资源端点地址：{content}"
+        );
+
+        // ② 从正文里取出地址，经端点取回图片字节
+        let url = regex::Regex::new(r"\]\(([^)]+)\)")
+            .unwrap()
+            .captures(&content)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .expect("正文应含 markdown 图片地址");
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(&url)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "资源端点应能取到图: {url}");
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+        let got = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(&got[..], png, "取回的应是压缩包里那张图的原始字节");
+
+        // ③ 不存在的条目 → 404（不能因为路径拼错就 500）
+        let bad = format!(
+            "/book-asset?url={}&path=nope.png",
+            urlencoding::encode(&book_url)
+        );
+        let resp = app
+            .clone()
+            .oneshot(axum::http::Request::builder().uri(&bad).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // ④ 非图片条目一律拒绝——这个端点不能变成任意读取压缩包内容的通道
+        let html = format!(
+            "/book-asset?url={}&path={}",
+            urlencoding::encode(&book_url),
+            urlencoding::encode("META-INF/container.xml")
+        );
+        let resp = app
+            .clone()
+            .oneshot(axum::http::Request::builder().uri(&html).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "非图片条目必须 404");
+
+        cleanup(state, dir).await;
+    }
+
     /// 端到端：uploadLocalBook 同文件重复上传去重（借鉴 booklore 稀疏指纹）
     #[tokio::test]
     async fn test_upload_local_book_dedupe_by_fingerprint() {
@@ -22169,9 +22338,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // 正文是「图片标记 + 资源端点地址」：页图不再 base64 进库，
+        // 由 /book-asset 按需从原压缩包取（见 api::book_asset）
         assert!(
-            content.starts_with("![1.png](data:image/png;base64,"),
-            "正文为图片标记"
+            content.starts_with("![1.png](/book-asset?url="),
+            "正文应为指向资源端点的图片标记，实际：{content}"
+        );
+        assert!(
+            content.contains(&format!("path={}", urlencoding::encode("1.png"))),
+            "地址应带上该页在压缩包内的条目路径：{content}"
         );
 
         // ② UMD：真实样本（样本缺失则跳过）

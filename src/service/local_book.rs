@@ -119,6 +119,17 @@ pub fn is_epub_toc_mode(s: &str) -> bool {
 /// - `toc+spin`：toc 顺序为骨架，spine 标题在 toc 标题为空时覆盖
 /// - `toc<spin`：toc 顺序为骨架，spine 标题强制覆盖 toc 标题
 pub fn parse_epub(bytes: &[u8], toc_mode: &str) -> Result<ImportedBook> {
+    parse_epub_with_assets(bytes, toc_mode, None)
+}
+
+/// EPUB 解析（`asset_base` 为 Some 时，正文图片写成资源端点地址而非内联 data URI——
+/// 见 [`ImgRef`]。仅「章节要入库」的导入路径传 Some；导出/预览等一次性用途仍用内联，
+/// 因为那些结果离开服务端后没法再回来取图）。
+pub fn parse_epub_with_assets(
+    bytes: &[u8],
+    toc_mode: &str,
+    asset_base: Option<&str>,
+) -> Result<ImportedBook> {
     let mut zip =
         zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("EPUB 不是有效的 zip")?;
 
@@ -135,7 +146,7 @@ pub fn parse_epub(bytes: &[u8], toc_mode: &str) -> Result<ImportedBook> {
 
     // 3-4. spine/manifest + 章节内容（公共提取）
     let opf_str = String::from_utf8_lossy(&opf);
-    let spin_chapters = opf_chapters(&mut zip, &opf_path, &opf_str);
+    let spin_chapters = opf_chapters(&mut zip, &opf_path, &opf_str, asset_base);
 
     // 5. 封面：OPF 声明的四级回退在 parse_opf 里做完；这里补最后一级——
     //    OPF 什么都没声明（野生中文 EPUB 常态）时裸扫 zip 找 *cover*.{jpg,png,webp,…}
@@ -159,6 +170,31 @@ pub fn parse_epub(bytes: &[u8], toc_mode: &str) -> Result<ImportedBook> {
         cover,
         format: "epub".into(),
     })
+}
+
+/// [`is_safe_zip_entry_path`] 的对外包装（资源端点复核用）
+pub fn is_safe_zip_entry_path_pub(name: &str) -> bool {
+    is_safe_zip_entry_path(name)
+}
+
+/// [`image_mime`] 的对外包装（资源端点判类型用）
+pub fn image_mime_pub(name: &str) -> Option<&'static str> {
+    image_mime(name)
+}
+
+/// 条目名 → 索引（精确名优先，其次按编码回退解码名匹配）——资源端点取图用
+pub fn zip_index_of_pub<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    path: &str,
+) -> Option<usize> {
+    // by_name 成功时用 by_name 的索引：zip 0.6 没有 index_for_name，故用解码名扫描统一处理
+    zip_index_by_decoded_name(zip, path)
+}
+
+/// 拼资源端点地址：`{base}&path={percent-encoded 条目路径}`。
+/// base 形如 `/book-asset?url=local%3A%2F%2F<uuid>`，由调用方（导入路径）给出。
+pub(crate) fn asset_url(base: &str, entry_path: &str) -> String {
+    format!("{base}&path={}", urlencoding::encode(entry_path))
 }
 
 /// 封面回退最后一级（借鉴 booklore：它的第 5 级同样是裸扫 ZIP 条目名）。
@@ -542,7 +578,7 @@ pub fn parse_opf_zip(bytes: &[u8]) -> Result<ImportedBook> {
     let opf = read_zip(&mut zip, &opf_path).context("读取 OPF 失败")?;
     let meta = parse_opf(&String::from_utf8_lossy(&opf));
     let opf_str = String::from_utf8_lossy(&opf);
-    let chapters: Vec<Chapter> = opf_chapters(&mut zip, &opf_path, &opf_str)
+    let chapters: Vec<Chapter> = opf_chapters(&mut zip, &opf_path, &opf_str, None)
         .into_iter()
         .map(|(_, c)| c)
         .collect();
@@ -567,6 +603,8 @@ fn opf_chapters<R: std::io::Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     opf_path: &str,
     opf_str: &str,
+    // Some(base) 时正文里的图片写成 `{base}&path=...` 资源地址（不内联字节）
+    asset_base: Option<&str>,
 ) -> Vec<(String, Chapter)> {
     let spine_refs: Vec<String> = extract_all_attr(opf_str, "itemref", "idref");
     let manifest: std::collections::HashMap<String, (String, String)> = extract_manifest(opf_str);
@@ -575,16 +613,24 @@ fn opf_chapters<R: std::io::Read + std::io::Seek>(
     let mut img_budget: u64 = MAX_EPUB_INLINE_IMAGE_BYTES;
 
     // 章节 HTML → 正文（图片经 zip 解析后内联为 data URI）
-    let mut render = |zip: &mut zip::ZipArchive<R>, html: &str, chapter_path: &str, budget: &mut u64| {
+    let render = |zip: &mut zip::ZipArchive<R>, html: &str, chapter_path: &str, budget: &mut u64| {
         html_to_text_with_images(html, |href| {
             let path = resolve_opf_path(chapter_path, href);
+            if let Some(base) = asset_base {
+                // 资源端点模式：只校验条目确实存在（避免写出必然 404 的地址），不读内容。
+                // 图片不再占 img_budget——此前超过 80MB 预算的图片是被**静默丢弃**的。
+                if zip.by_name(&path).is_err() && zip_index_by_decoded_name(zip, &path).is_none() {
+                    return None;
+                }
+                return Some(ImgRef::Url(asset_url(base, &path)));
+            }
             let bytes = read_zip_limited(zip, &path, MAX_ZIP_ENTRY_BYTES).ok()?;
             if bytes.is_empty() || bytes.len() as u64 > *budget {
                 return None;
             }
             *budget -= bytes.len() as u64;
             let mime = image_mime(&path).unwrap_or("image/jpeg");
-            Some((bytes, mime))
+            Some(ImgRef::Data(bytes, mime))
         })
     };
 
@@ -2514,11 +2560,22 @@ pub(crate) fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 /// 对齐 legacy CbzFile：解析 ComicInfo.xml 的 Title/Writer 作为书名/作者，并取
 /// zip 条目顺序的首张图片作封面（封面字节走 uploaded.cover 落盘 covers/）。
 pub fn parse_cbz(bytes: &[u8]) -> Result<ImportedBook> {
-    parse_cbz_impl(bytes, MAX_CBZ_TOTAL_BYTES)
+    parse_cbz_impl(bytes, MAX_CBZ_TOTAL_BYTES, None)
+}
+
+/// CBZ 解析（asset_base 为 Some 时页图写成资源端点地址）。
+/// 漫画是内联开销最大的一类：整本图片 base64 进库要多占 33%，且每翻一页都要
+/// 从 DB 取出整张图的 base64 再解码。
+pub fn parse_cbz_with_assets(bytes: &[u8], asset_base: Option<&str>) -> Result<ImportedBook> {
+    parse_cbz_impl(bytes, MAX_CBZ_TOTAL_BYTES, asset_base)
 }
 
 /// 带累计输出上限的 CBZ 解析（P1-C3；测试用小上限验证超限路径）
-fn parse_cbz_impl(bytes: &[u8], total_max: u64) -> Result<ImportedBook> {
+fn parse_cbz_impl(
+    bytes: &[u8],
+    total_max: u64,
+    asset_base: Option<&str>,
+) -> Result<ImportedBook> {
     let mut zip =
         zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("CBZ 不是有效的 zip")?;
     let mut pages: Vec<(String, usize)> = Vec::new();
@@ -2579,26 +2636,32 @@ fn parse_cbz_impl(bytes: &[u8], total_max: u64) -> Result<ImportedBook> {
     // P1-C3：全部条目累计输出上限（解压炸弹防护——条目多/单条目大均受限）
     let mut total = 0u64;
     for (name, idx) in pages {
-        // 按索引读：解码后的名字与 zip crate 内部名可能不同，by_name 会查不到
-        let bytes = read_zip_index(&mut zip, idx).context("读取 CBZ 图片失败")?;
-        total = total.saturating_add(bytes.len() as u64);
-        if total > total_max {
-            anyhow::bail!(
-                "CBZ 图片累计超出大小上限（{}MB），已拒绝",
-                total_max / 1024 / 1024
-            );
-        }
         let file_name = std::path::Path::new(&name)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| name.clone());
-        let mime = image_mime(&name).unwrap_or("image/jpeg");
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
         // alt 文本避免前端 singleImageUrl 正则的 `]` 边界字符
         let alt = file_name.replace([']', ')'], "-");
+        let content = if let Some(base) = asset_base {
+            // 资源端点模式：页图不进库，按需从原压缩包流出（也就不再受累计上限约束）
+            format!("![{alt}]({})", asset_url(base, &name))
+        } else {
+            // 按索引读：解码后的名字与 zip crate 内部名可能不同，by_name 会查不到
+            let bytes = read_zip_index(&mut zip, idx).context("读取 CBZ 图片失败")?;
+            total = total.saturating_add(bytes.len() as u64);
+            if total > total_max {
+                anyhow::bail!(
+                    "CBZ 图片累计超出大小上限（{}MB），已拒绝",
+                    total_max / 1024 / 1024
+                );
+            }
+            let mime = image_mime(&name).unwrap_or("image/jpeg");
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            format!("![{alt}](data:{mime};base64,{b64})")
+        };
         chapters.push(Chapter {
             title: file_name.clone(),
-            content: format!("![{alt}](data:{mime};base64,{b64})"),
+            content,
         });
     }
     Ok(ImportedBook {
@@ -3111,10 +3174,31 @@ pub fn parse_file_bytes(
     toc_mode: &str,
     split_long: bool,
 ) -> Result<ImportedBook> {
+    parse_file_bytes_with_assets(bytes, ext, user_rules, toc_mode, split_long, None)
+}
+
+/// 按扩展名分派解析（带资源端点地址）。
+///
+/// `asset_base` 为 Some 时，**EPUB / CBZ** 的正文图片写成 `{base}&path=...` 地址而不是
+/// 内联 data URI：章节文本因此小到可忽略，图片交给浏览器按需拉取与缓存，
+/// 也不再受内联预算上限（超预算的图此前是被静默丢弃的）。
+///
+/// 只有「章节会入库、且原文件会长期留存」的导入路径才该传 Some；
+/// 导出/预览等一次性用途必须保持内联——那些结果离开服务端后没法再回来取图。
+/// PDF 转图片书仍走内联：它的图来自 PDF 对象而非压缩包条目，端点无从按路径取。
+pub fn parse_file_bytes_with_assets(
+    bytes: &[u8],
+    ext: &str,
+    user_rules: &[String],
+    toc_mode: &str,
+    split_long: bool,
+    asset_base: Option<&str>,
+) -> Result<ImportedBook> {
     match ext {
-        "epub" => parse_epub(bytes, toc_mode),
+        "epub" => parse_epub_with_assets(bytes, toc_mode, asset_base),
         // zip：优先标准 EPUB（container.xml）→ fallback 裸 OPF 结构
-        "zip" => parse_epub(bytes, toc_mode).or_else(|_| parse_opf_zip(bytes)),
+        "zip" => parse_epub_with_assets(bytes, toc_mode, asset_base)
+            .or_else(|_| parse_opf_zip(bytes)),
         "txt" => {
             let mut imported = parse_txt_with_rules(bytes, user_rules)?;
             imported.chapters = split_long_chapters(imported.chapters, split_long);
@@ -3125,7 +3209,7 @@ pub fn parse_file_bytes(
         "pdf" => parse_pdf(bytes),
         "fb2" => parse_fb2(bytes),
         "docx" => parse_docx(bytes),
-        "cbz" => parse_cbz(bytes),
+        "cbz" => parse_cbz_with_assets(bytes, asset_base),
         "umd" => parse_umd(bytes),
         other => anyhow::bail!("不支持的格式：{other}"),
     }
@@ -3139,9 +3223,20 @@ pub fn parse_loc_book_path(
     toc_mode: &str,
     split_long: bool,
 ) -> Result<ImportedBook> {
+    parse_loc_book_path_with_assets(path, user_rules, toc_mode, split_long, None)
+}
+
+/// 同 [`parse_loc_book_path`]，但可指定资源端点地址（见 [`parse_file_bytes_with_assets`]）
+pub fn parse_loc_book_path_with_assets(
+    path: &std::path::Path,
+    user_rules: &[String],
+    toc_mode: &str,
+    split_long: bool,
+    asset_base: Option<&str>,
+) -> Result<ImportedBook> {
     let bytes = std::fs::read(path)?;
     let ext = file_ext(&path.to_string_lossy());
-    parse_file_bytes(&bytes, &ext, user_rules, toc_mode, split_long)
+    parse_file_bytes_with_assets(&bytes, &ext, user_rules, toc_mode, split_long, asset_base)
 }
 
 /// 兼容旧签名：默认 EPUB 目录模式、不拆长章节
@@ -3398,9 +3493,18 @@ fn html_to_text(html: &str) -> String {
 /// 输出（阅读器已支持该形式），与文本段落按文档顺序交错。
 ///
 /// EPUB 封面页常是「body 内只有一张图」，此前图片被整体丢弃 → 阅读器只显示标题空页。
+/// 正文里的图片引用形态
+pub(crate) enum ImgRef {
+    /// 内联 data URI：自包含，章节文本离开原文件也能显示（PDF 转图片书 / 无原文件时用）
+    Data(Vec<u8>, &'static str),
+    /// 指向资源端点的 URL：正文只存地址，图片按需从原压缩包流出
+    /// （浏览器可缓存、可懒加载，且不受 MAX_EPUB_INLINE_IMAGE_BYTES 预算限制）
+    Url(String),
+}
+
 fn html_to_text_with_images<F>(html: &str, mut resolve_img: F) -> String
 where
-    F: FnMut(&str) -> Option<(Vec<u8>, &'static str)>,
+    F: FnMut(&str) -> Option<ImgRef>,
 {
     use base64::Engine;
     use scraper::node::Node;
@@ -3433,7 +3537,7 @@ where
                     .map(|(_, v)| v)
                     .unwrap_or("");
                 if !href.is_empty() {
-                    if let Some((bytes, mime)) = resolve_img(href) {
+                    if let Some(img) = resolve_img(href) {
                         let alt = e
                             .attrs()
                             .find(|(k, _)| k.rsplit(':').next().unwrap_or(k) == "alt")
@@ -3442,8 +3546,14 @@ where
                             .unwrap_or("图片")
                             // alt 避免前端 singleImageUrl 正则的 `]`/`)` 边界字符
                             .replace([']', ')'], "-");
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        parts.push(format!("![{alt}](data:{mime};base64,{b64})"));
+                        match img {
+                            ImgRef::Data(bytes, mime) => {
+                                let b64 =
+                                    base64::engine::general_purpose::STANDARD.encode(&bytes);
+                                parts.push(format!("![{alt}](data:{mime};base64,{b64})"));
+                            }
+                            ImgRef::Url(url) => parts.push(format!("![{alt}]({url})")),
+                        }
                     }
                 }
                 continue;
@@ -5114,7 +5224,7 @@ mod tests {
     fn cbz_total_oversize_rejected() {
         let page = vec![0x89u8; 60 * 1024]; // 60KB/页
         let bytes = build_cbz(&[("p1.jpg", &page), ("p2.jpg", &page), ("p3.jpg", &page)]);
-        let err = parse_cbz_impl(&bytes, 100_000).unwrap_err().to_string();
+        let err = parse_cbz_impl(&bytes, 100_000, None).unwrap_err().to_string();
         assert!(err.contains("累计超出"), "CBZ 累计超限应拒绝: {err}");
         // 默认上限（500MB）下正常解析
         let book = parse_cbz(&bytes).unwrap();
@@ -5521,7 +5631,7 @@ mod tests {
         let png = vec![0x89u8, b'P', b'N', b'G'];
         let out = html_to_text_with_images(html, |href| {
             assert_eq!(href, "images/cover.jpg");
-            Some((png.clone(), "image/jpeg"))
+            Some(ImgRef::Data(png.clone(), "image/jpeg"))
         });
         assert!(out.contains("![封面](data:image/jpeg;base64,"), "应内联图片: {out:?}");
         assert!(out.contains("正文一段"), "文字应保留: {out:?}");
@@ -5535,7 +5645,7 @@ mod tests {
             <image width="600" height="800" xlink:href="cover.jpeg"/></svg></body></html>"#;
         let out = html_to_text_with_images(html, |href| {
             assert!(href.ends_with("cover.jpeg"), "href={href}");
-            Some((vec![1, 2, 3], "image/jpeg"))
+            Some(ImgRef::Data(vec![1, 2, 3], "image/jpeg"))
         });
         assert!(out.contains("(data:image/jpeg;base64,"), "SVG image 应内联: {out:?}");
     }

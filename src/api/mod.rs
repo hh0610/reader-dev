@@ -1,5 +1,6 @@
 //! HTTP API（/reader3/*，兼容 legacy）
 
+pub mod book_asset;
 pub mod files;
 pub mod opds;
 pub mod range;
