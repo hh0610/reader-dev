@@ -31,6 +31,24 @@ use crate::storage::Storage;
 
 /// 事件去抖窗口（300ms 批量——连续写入合并为一次对账）
 const DEBOUNCE_MS: Duration = Duration::from_millis(300);
+/// 写入完成判定：mtime 距今超过这个时长即认为文件已写完（借鉴 booklore 的
+/// STABILITY_CHECK；它取 3s）。**这条是快路径**：书仓里早就躺着的存量文件
+/// 一律直接通过，不会为每本书白等一轮。
+/// 慢盘/网盘挂载可用 env READER_LOCAL_SETTLE_MS 调大。
+const SETTLE_QUIET_MS: i64 = 3_000;
+
+/// 实际生效的静默阈值（env READER_LOCAL_SETTLE_MS 覆盖；非法值回退默认）
+fn settle_quiet_ms() -> i64 {
+    std::env::var("READER_LOCAL_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(SETTLE_QUIET_MS)
+}
+/// mtime 还很新时的轮询间隔
+const SETTLE_POLL: Duration = Duration::from_millis(1_000);
+/// 等待写入完成的上限：超时后照常尝试导入（宁可解析失败，也不能有文件永远不被导入）
+const SETTLE_MAX_WAIT: Duration = Duration::from_secs(60);
 /// 书仓目录名（storage/data/{ns}/books/）
 const BOOKS_DIR: &str = "books";
 /// 书仓支持的文件格式（与 SUPPORTED_EXTENSIONS 一致但排除 zip——zip 语义歧义
@@ -224,7 +242,7 @@ pub async fn reconcile_namespace(storage: &Storage, ns: &str) -> Result<bool> {
         .filter(|p| !p.as_os_str().is_empty())
         .into_iter()
         .collect();
-    reconcile_namespace_dirs(storage, ns, &env_dirs).await
+    reconcile_namespace_dirs(storage, ns, &env_dirs, settle_quiet_ms()).await
 }
 
 /// 对账核心（env_dirs 为额外书仓目录；测试直接传入临时目录，避免进程级 env 竞态）
@@ -232,6 +250,8 @@ async fn reconcile_namespace_dirs(
     storage: &Storage,
     ns: &str,
     env_dirs: &[PathBuf],
+    // 写入完成判定的静默阈值（毫秒）；测试传 0 表示不等待
+    settle_quiet_ms: i64,
 ) -> Result<bool> {
     let books_dir = storage
         .config
@@ -282,6 +302,10 @@ async fn reconcile_namespace_dirs(
     for path in &files {
         let key = normalize_path(&path.to_string_lossy());
         crate::service::fs_rate::tick().await;
+        // 正在写入的文件先等它落定，否则会解析到半截文件（存量文件走快路径，零等待）
+        if !wait_until_settled(path, settle_quiet_ms).await {
+            continue; // 等待期间文件消失
+        }
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(_) => continue, // 事件竞态：文件已被删除
@@ -697,6 +721,63 @@ fn normalize_path(p: &str) -> String {
 }
 
 /// 文件修改时间（ms epoch；失败回退 0——与大小共同判定变更）
+/// 等待文件写入完成后再导入（借鉴 booklore 的 checkStability）。
+///
+/// 没有这道闸时的现象：往书仓拷一本 200MB 的 PDF，notify 在**第一个字节落盘**就报
+/// Create/Modify，对账立刻去解析半截文件——轻则「未解析到章节内容」导入失败，
+/// 重则导入一本只有前几章的残书，且因为 mtime/size 后续还会变，要等下一轮事件才纠正。
+///
+/// 判定：mtime 距今 ≥ SETTLE_QUIET_MS 即认为写完（快路径，存量文件零等待）。
+/// mtime 仍新则每秒轮询一次，直到 (size, mtime) 连续两次观测不变且已静默；
+/// 超过 SETTLE_MAX_WAIT 则放行并告警。
+///
+/// 关于「拷贝工具保留源 mtime」：cp -p / rsync -t 都是**写完之后**才设置属性，
+/// 拷贝进行中 mtime 仍是当下时间，所以 mtime 静默判据在这些工具下同样成立；
+/// rsync 更是先写 `.tmp` 再改名，根本不会被中途看到。
+///
+/// 返回 false 表示文件在等待期间消失（调用方应跳过）。
+async fn wait_until_settled(path: &Path, quiet_ms: i64) -> bool {
+    let start = Instant::now();
+    let mut last: Option<(u64, i64)> = None;
+    loop {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false; // 等待期间被删除/改名
+        };
+        let size = meta.len();
+        let mtime = file_mtime_ms(&meta);
+        let quiet = now_ms().saturating_sub(mtime) >= quiet_ms;
+        if quiet {
+            // 已静默且是 0 字节 → 不是书，直接跳过。
+            // （早期实现在这里继续轮询，结果书仓里一个残留的空文件就能让**每一轮对账**
+            //   白等满 SETTLE_MAX_WAIT。文件后续若长出内容，mtime 变化会再触发事件。）
+            if size == 0 {
+                return false;
+            }
+            if last.is_none() || last == Some((size, mtime)) {
+                return true;
+            }
+        }
+        if start.elapsed() >= SETTLE_MAX_WAIT {
+            tracing::warn!(
+                "本地书：{} 在 {}s 内仍在变化，按现状尝试导入",
+                path.display(),
+                SETTLE_MAX_WAIT.as_secs()
+            );
+            return size > 0;
+        }
+        last = Some((size, mtime));
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
+/// 当前时间（毫秒）
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 fn file_mtime_ms(m: &std::fs::Metadata) -> i64 {
     m.modified()
         .ok()
@@ -731,6 +812,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 写入完成检测：正在写的文件要等，写完的立刻放行，等待中消失的返回 false
+    #[tokio::test]
+    async fn 写入完成检测() {
+        let dir = std::env::temp_dir().join(format!("settle-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // ① 存量文件（阈值 0 = 视为早已静默）→ 立即放行，不等待
+        let p = dir.join("done.txt");
+        std::fs::write(&p, b"content").unwrap();
+        let t0 = Instant::now();
+        assert!(wait_until_settled(&p, 0).await, "已写完的文件应立即通过");
+        assert!(
+            t0.elapsed() < SETTLE_POLL,
+            "快路径不该轮询，实际耗时 {:?}",
+            t0.elapsed()
+        );
+
+        // ② 已静默的 0 字节文件 → 立即跳过（不是书）。
+        //    早期实现在这里继续轮询，导致书仓里一个残留空文件就能让每轮对账白等满 60s。
+        let empty = dir.join("empty.txt");
+        std::fs::write(&empty, b"").unwrap();
+        let t0 = Instant::now();
+        assert!(!wait_until_settled(&empty, 0).await, "空文件应判为跳过");
+        assert!(
+            t0.elapsed() < SETTLE_POLL,
+            "空文件必须立刻返回，不能拖住对账，实际 {:?}",
+            t0.elapsed()
+        );
+
+        // ③ 等待期间文件消失 → false（对账应跳过而不是报错）
+        let gone = dir.join("gone.txt");
+        std::fs::write(&gone, b"x").unwrap();
+        let g = gone.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = std::fs::remove_file(&g);
+        });
+        // 阈值取得足够大，保证进入轮询分支
+        assert!(
+            !wait_until_settled(&gone, 60_000).await,
+            "等待期间文件消失应返回 false"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 静默阈值可由 env 覆盖（慢盘/网盘挂载调大）
+    #[test]
+    fn 静默阈值env覆盖() {
+        // 未设置时用默认值
+        std::env::remove_var("READER_LOCAL_SETTLE_MS");
+        assert_eq!(settle_quiet_ms(), SETTLE_QUIET_MS);
+        std::env::set_var("READER_LOCAL_SETTLE_MS", "8000");
+        assert_eq!(settle_quiet_ms(), 8_000);
+        // 非法值回退默认，而不是 panic 或变成 0（0 会让「等写完」这道闸整个失效）
+        std::env::set_var("READER_LOCAL_SETTLE_MS", "abc");
+        assert_eq!(settle_quiet_ms(), SETTLE_QUIET_MS);
+        std::env::set_var("READER_LOCAL_SETTLE_MS", "-5");
+        assert_eq!(settle_quiet_ms(), SETTLE_QUIET_MS);
+        std::env::remove_var("READER_LOCAL_SETTLE_MS");
+    }
+
     /// 隔离 env READER_LOCAL_BOOK_DIR：多数测试走 reconcile_namespace_dirs（显式目录），
     /// 不读进程 env——唯一读 env 的测试单独 set_var（无其他测试再写该变量，无竞态）
     fn no_env_dirs() -> Vec<PathBuf> {
@@ -760,7 +903,7 @@ mod tests {
     async fn reconcile_imports_new_file() {
         let storage = test_storage("import").await;
         write_txt(&books_dir(&storage, "default").join("测试书.txt"), SAMPLE1);
-        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs(), 0)
             .await
             .unwrap();
         assert!(changed);
@@ -791,7 +934,7 @@ mod tests {
         assert_eq!(toc[0].1, "第一章 起点");
         assert_eq!(toc[1].1, "第二章 成长");
         // 幂等：再次对账无变更
-        let changed2 = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+        let changed2 = reconcile_namespace_dirs(&storage, "default", &no_env_dirs(), 0)
             .await
             .unwrap();
         assert!(!changed2);
@@ -806,7 +949,7 @@ mod tests {
         let storage = test_storage("rescan").await;
         let path = books_dir(&storage, "default").join("测试书.txt");
         write_txt(&path, SAMPLE1);
-        reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+        reconcile_namespace_dirs(&storage, "default", &no_env_dirs(), 0)
             .await
             .unwrap();
         let book_url = storage.list_books("default").await.unwrap()[0]
@@ -816,7 +959,7 @@ mod tests {
         // 但跨平台稳妥起见内容长度也变化，mtime/大小任一不同即触发）
         std::thread::sleep(Duration::from_millis(20));
         write_txt(&path, SAMPLE2);
-        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs(), 0)
             .await
             .unwrap();
         assert!(changed);
@@ -846,7 +989,7 @@ mod tests {
         let storage = test_storage("delete").await;
         let path = books_dir(&storage, "default").join("测试书.txt");
         write_txt(&path, SAMPLE1);
-        reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+        reconcile_namespace_dirs(&storage, "default", &no_env_dirs(), 0)
             .await
             .unwrap();
         let book_url = storage.list_books("default").await.unwrap()[0]
@@ -854,7 +997,7 @@ mod tests {
             .clone();
         // 删除文件
         std::fs::remove_file(&path).unwrap();
-        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs(), 0)
             .await
             .unwrap();
         assert!(changed);
@@ -873,7 +1016,7 @@ mod tests {
         // 文件重现（内容变化）→ 重链 + 重扫
         std::thread::sleep(Duration::from_millis(20));
         write_txt(&path, SAMPLE2);
-        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs(), 0)
             .await
             .unwrap();
         assert!(changed);
@@ -933,7 +1076,7 @@ mod tests {
             .await
             .unwrap();
 
-        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+        let changed = reconcile_namespace_dirs(&storage, "default", &no_env_dirs(), 0)
             .await
             .unwrap();
         assert!(changed);
@@ -969,7 +1112,7 @@ mod tests {
         assert!(imported.cover.is_some());
         assert_eq!(imported.cover.unwrap(), cover_bytes);
         // 幂等：不再重复生成
-        let changed2 = reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+        let changed2 = reconcile_namespace_dirs(&storage, "default", &no_env_dirs(), 0)
             .await
             .unwrap();
         assert!(!changed2);
@@ -999,7 +1142,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        reconcile_namespace_dirs(&storage, "default", &no_env_dirs())
+        reconcile_namespace_dirs(&storage, "default", &no_env_dirs(), 0)
             .await
             .unwrap();
         let books = storage.list_books("default").await.unwrap();
