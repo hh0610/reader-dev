@@ -5279,10 +5279,19 @@ fn write_zip_entry(
 }
 
 /// F-35：扫描 books 表 can_update=1 的书 → analyze_toc → 回写
-/// latest_chapter_title / total_chapter_num（单本失败跳过，不影响其余）
+/// latest_chapter_title / total_chapter_num（单本失败跳过，不影响其余）。
+///
+/// 有界并发（6）+ 单书超时（60s）：此前逐本串行，几十本网络书遇到几个慢源
+/// 一轮检查要跑几分钟（每本最长吃满 analyze_toc 内部超时）。并发数刻意比
+/// 搜索的 24 小得多——更新检查是后台任务，对源站保持温和；同一本书内部
+/// analyze_toc 的多页抓取仍是串行，不叠加放大。
 pub async fn run_shelf_update(storage: &Storage) -> Result<usize> {
+    const CONCURRENCY: usize = 6;
+    const PER_BOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
     let books = storage.list_updatable_books().await?;
-    let mut updated = 0usize;
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
+    let mut tasks = tokio::task::JoinSet::new();
     for book in books {
         // 本地书（local:// 或 storage 文件型）无书源可抓，跳过
         if book.origin == "local"
@@ -5294,45 +5303,66 @@ pub async fn run_shelf_update(storage: &Storage) -> Result<usize> {
         if book.toc_url.trim().is_empty() {
             continue;
         }
-        // 书源缺失（用户/系统均无）→ 无法抓取，跳过
-        let Ok(Some(source)) = storage
-            .find_book_source(&book.user_namespace, &book.origin)
-            .await
-        else {
-            continue;
-        };
-        match crate::service::book::analyze_toc(
-            &book.user_namespace,
-            &book.toc_url,
-            &source,
-            20,
-            Some(&book.name),
-            &book.book_url,
-        )
-        .await
-        {
-            Ok(chapters) if !chapters.is_empty() => {
-                let non_volume: Vec<&crate::model::book_chapter::BookChapter> =
-                    chapters.iter().filter(|c| !c.is_volume).collect();
-                let latest = non_volume.last().map(|c| c.title.clone());
-                let total = non_volume.len() as i64;
-                let now = chrono::Utc::now().timestamp_millis();
-                match storage
-                    .update_book_update_info(
-                        &book.user_namespace,
-                        &book.book_url,
-                        latest.as_deref(),
-                        total,
-                        now,
-                    )
-                    .await
-                {
-                    Ok(_) => updated += 1,
-                    Err(e) => tracing::warn!("书架更新回写失败 [{}]: {e:#}", book.book_url),
+        let storage = storage.clone();
+        let sem = sem.clone();
+        tasks.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok()?;
+            // 书源缺失（用户/系统均无）→ 无法抓取，跳过
+            let source = storage
+                .find_book_source(&book.user_namespace, &book.origin)
+                .await
+                .ok()
+                .flatten()?;
+            let toc = tokio::time::timeout(
+                PER_BOOK_TIMEOUT,
+                crate::service::book::analyze_toc(
+                    &book.user_namespace,
+                    &book.toc_url,
+                    &source,
+                    20,
+                    Some(&book.name),
+                    &book.book_url,
+                ),
+            )
+            .await;
+            match toc {
+                Ok(Ok(chapters)) if !chapters.is_empty() => {
+                    let non_volume: Vec<&crate::model::book_chapter::BookChapter> =
+                        chapters.iter().filter(|c| !c.is_volume).collect();
+                    let latest = non_volume.last().map(|c| c.title.clone());
+                    let total = non_volume.len() as i64;
+                    let now = chrono::Utc::now().timestamp_millis();
+                    match storage
+                        .update_book_update_info(
+                            &book.user_namespace,
+                            &book.book_url,
+                            latest.as_deref(),
+                            total,
+                            now,
+                        )
+                        .await
+                    {
+                        Ok(_) => return Some(()),
+                        Err(e) => {
+                            tracing::warn!("书架更新回写失败 [{}]: {e:#}", book.book_url)
+                        }
+                    }
                 }
+                Ok(Ok(_)) => {} // 无章节规则/空目录：无可更新内容，跳过
+                Ok(Err(e)) => tracing::warn!("书架更新跳过 [{}]: {e:#}", book.book_url),
+                Err(_) => tracing::warn!(
+                    "书架更新超时跳过 [{}]（>{}s）",
+                    book.book_url,
+                    PER_BOOK_TIMEOUT.as_secs()
+                ),
             }
-            Ok(_) => {} // 无章节规则/空目录：无可更新内容，跳过
-            Err(e) => tracing::warn!("书架更新跳过 [{}]: {e:#}", book.book_url),
+            None
+        });
+    }
+    let mut updated = 0usize;
+    while let Some(res) = tasks.join_next().await {
+        if matches!(res, Ok(Some(()))) {
+            updated += 1;
         }
     }
     Ok(updated)
