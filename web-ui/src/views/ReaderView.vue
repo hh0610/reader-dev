@@ -3284,31 +3284,39 @@ async function switchSource(r: SearchBook) {
     const oldTitle = currentChapter.value?.title ?? ''
     const oldPos = currentPos()
     const isTemp = !!(b as unknown as { isTemp?: boolean }).isTemp
-    if (!isTemp) {
-      await saveBook({
-        bookUrl: b.bookUrl,
-        origin: r.origin,
-        originName: r.originName,
-        tocUrl: r.tocUrl,
-      } as Book)
-    }
-    b.origin = r.origin
-    b.originName = r.originName
-    b.tocUrl = r.tocUrl
+    // 换源目标的有效 tocUrl：候选源多数不返回 tocUrl，用其 bookUrl 兜底
+    // （后端会在必要时经详情页解析出真实目录页）。
+    // 注意：**不可把空 tocUrl 落库**——此前直接存 r.tocUrl（常为空），
+    // 之后每次打开该书都是「tocUrl 空 + 不传 url」→ 后端报「请输入书籍链接」，
+    // 等于把这本书永久写坏。
+    const nextTocUrl = r.tocUrl || r.bookUrl || b.bookUrl
     currentOrigin.value = r.origin
     // 同上：用候选源自己的 tocUrl/bookUrl（b.tocUrl 此刻已被赋为 r.tocUrl，
     // 若候选源搜索结果无 tocUrl 则两者皆空 → 换源必失败）
     const tocRes = await getBookToc(
-      r.tocUrl || r.bookUrl,
+      nextTocUrl,
       r.origin,
       { timeout: chapterTimeout.value * 1000 },
       r.bookUrl,
     )
     if (!tocRes.isSuccess || !tocRes.data?.length) {
       ElMessage.error('新书源目录获取失败，请重试')
-      return
+      return // 目录拿不到就不落库，避免把书架里的书写成不可用状态
     }
     const toc = tocRes.data
+    // 目录确认可用后再落库：bookUrl 也要切到候选源的（否则 origin 与 bookUrl 分属两源）
+    if (!isTemp) {
+      await saveBook({
+        bookUrl: r.bookUrl || b.bookUrl,
+        origin: r.origin,
+        originName: r.originName,
+        tocUrl: nextTocUrl,
+      } as Book)
+    }
+    b.origin = r.origin
+    b.originName = r.originName
+    b.tocUrl = nextTocUrl
+    if (r.bookUrl) b.bookUrl = r.bookUrl
     let startIdx = relocateChapterIndex(oldIdx, oldTitle, toc)
     if (startIdx < 0) startIdx = toc.findIndex((c) => !c.isVolume)
     if (startIdx < 0) startIdx = 0
@@ -3770,9 +3778,14 @@ async function init() {
 
     // 目录 + 详情并行拉取
     const [tocRes, infoRes] = await Promise.allSettled([
-      getBookToc(shelfBook.value!.tocUrl, shelfBook.value!.origin, {
-        timeout: chapterTimeout.value * 1000,
-      }),
+      // tocUrl 兜底 bookUrl 并附带 url：历史换源可能把空 tocUrl 落了库，
+      // 只传空 tocUrl 会得到「请输入书籍链接」
+      getBookToc(
+        shelfBook.value!.tocUrl || shelfBook.value!.bookUrl,
+        shelfBook.value!.origin,
+        { timeout: chapterTimeout.value * 1000 },
+        shelfBook.value!.bookUrl,
+      ),
       getBookInfo(shelfBook.value!.bookUrl, shelfBook.value!.origin, { silent: true }),
     ])
     if (tocRes.status === 'fulfilled' && tocRes.value.isSuccess) {
