@@ -26,6 +26,12 @@ export interface Book {
   kind?: string | null
   customTag?: string | null
   coverUrl?: string | null
+  /** 书架网格用的缩略图地址（后端下发：本地封面 → /cover-thumb/...；远程封面原样返回） */
+  thumbUrl?: string | null
+  /** 元数据完整度 0–100（后端加权计算；已锁定字段视为已填） */
+  metaScore?: number
+  /** 缺失的元数据字段名（按权重降序），供详情页提示补哪几项 */
+  metaMissing?: string[]
   customCoverUrl?: string | null
   intro?: string | null
   customIntro?: string | null

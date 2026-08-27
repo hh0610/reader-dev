@@ -18,6 +18,7 @@ pub mod local_book;
 pub mod local_sync;
 pub mod login;
 pub mod mongodb_backup;
+pub mod meta_score;
 pub mod monitor;
 pub mod rss;
 pub mod schedule;

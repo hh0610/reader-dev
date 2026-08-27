@@ -798,6 +798,14 @@ pub async fn save_book_cover(storage: &Storage, ns: &str, book_url: &str, cover:
     if std::fs::write(cover_dir.join(&file_id), &bytes).is_err() {
         return false;
     }
+    // 顺手把书架网格用的缩略图也生成好——导入时本来就已经把图解码在手，
+    // 比等第一次打开书架再现算划算。失败无所谓，端点会按需再生成。
+    if let Some((thumb, _, _)) = crate::service::imaging::make_thumbnail(&bytes) {
+        let thumb_dir = cover_dir.join("thumbs");
+        if std::fs::create_dir_all(&thumb_dir).is_ok() {
+            let _ = std::fs::write(thumb_dir.join(&file_id), &thumb);
+        }
+    }
     storage
         .update_book_cover(ns, book_url, &format!("/assets/{ns}/covers/{file_id}"))
         .await

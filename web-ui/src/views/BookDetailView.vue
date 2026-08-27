@@ -830,6 +830,31 @@ async function toggleCanUpdate() {
   }
 }
 
+/* ================= 元数据完整度（后端 metaScore/metaMissing；已锁定字段视为已填） ================= */
+
+/** 字段名 → 中文标签（与后端 service::meta_score 的 WEIGHTS 一一对应） */
+const META_FIELD_LABEL: Record<string, string> = {
+  name: '书名',
+  author: '作者',
+  coverUrl: '封面',
+  intro: '简介',
+  kind: '分类',
+  language: '语言',
+  publisher: '出版社',
+  publishedAt: '出版日期',
+}
+/** 完整度百分比；书架里没有这本书（未加入书架）时为 null，不显示 */
+const metaScore = computed<number | null>(() => {
+  const v = shelfBook.value?.metaScore
+  return typeof v === 'number' ? v : null
+})
+/** 缺失字段的中文标签（后端已按权重降序；最多列 3 项，避免按钮被撑得很长） */
+const metaMissingLabels = computed<string[]>(() =>
+  (shelfBook.value?.metaMissing ?? [])
+    .slice(0, 3)
+    .map((f) => META_FIELD_LABEL[f] ?? f),
+)
+
 /* ================= GAP 145：元数据编辑（书名/作者/标签/简介弹窗表单——saveBook patch 字段，详情即时刷新） ================= */
 
 const editOpen = ref(false)
@@ -1254,6 +1279,17 @@ watch(bookUrl, () => {
             <button v-if="shelfBook" class="search-btn" type="button" @click="openSearch">全书搜索</button>
             <!-- GAP 145：编辑元数据（书名/作者/标签/简介弹窗） -->
             <button v-if="shelfBook" class="search-btn" type="button" @click="openEdit">编辑</button>
+            <!-- 元数据完整度：只在不满分时出现，点它直接进编辑弹窗补 -->
+            <button
+              v-if="metaScore !== null && metaScore < 100"
+              class="search-btn meta-score"
+              type="button"
+              :title="`元数据完整度 ${metaScore}%，缺：${metaMissingLabels.join('、')}`"
+              @click="openEdit"
+            >
+              元数据 {{ metaScore }}%
+              <span class="meta-missing">缺 {{ metaMissingLabels.join('、') }}</span>
+            </button>
             <!-- 换源（书架书且带书源：搜索同书其他书源并切换） -->
             <button v-if="canSwitchSource()" class="search-btn" type="button" @click="openSource">换源</button>
             <!-- 导出（GET /reader3/exportBook：txt/epub/html blob 下载） -->
@@ -2124,6 +2160,24 @@ watch(bookUrl, () => {
     color 0.2s ease,
     border-color 0.2s ease,
     background-color 0.2s ease;
+}
+/* 元数据完整度：是提示不是主操作，字距收紧、颜色压低，不跟「阅读/换源」抢注意力 */
+.meta-score {
+  padding: 13px 20px;
+  letter-spacing: 1px;
+  color: var(--text-3);
+  border-style: dashed;
+}
+.meta-score .meta-missing {
+  margin-left: 8px;
+  font-size: 12px;
+  opacity: 0.75;
+}
+@media (max-width: 720px) {
+  /* 窄屏只留百分比，缺失项看 title 提示——否则这个按钮会把操作区挤到换行 */
+  .meta-score .meta-missing {
+    display: none;
+  }
 }
 .search-btn:hover {
   color: var(--accent);

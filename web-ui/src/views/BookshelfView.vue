@@ -712,8 +712,15 @@ function coverColor(name: string): string {
   return MORANDI[hashName(name) % MORANDI.length]
 }
 
-function coverSrc(book: Book): string | null {
-  const src = book.customCoverUrl || book.coverUrl || null
+/**
+ * 封面地址。`thumb=true` 时优先用后端下发的缩略图（250x350，书架网格用）——
+ * 一屏几十本书各拉 1000x1500 的完整封面纯属浪费，格子实际只有一两百像素宽。
+ * 自定义封面（/reader3/file/ 内联流）与远程封面没有缩略图，thumbUrl 会等于原地址。
+ */
+function coverSrc(book: Book, thumb = false): string | null {
+  const custom = book.customCoverUrl || null
+  // 用户自定义封面优先，且它没有缩略图（不是 /assets/{ns}/covers/ 形态）
+  const src = custom || (thumb ? book.thumbUrl : null) || book.coverUrl || null
   return src ? proxyImageUrl(resolveCoverUrl(src)) ?? null : null
 }
 
@@ -2481,7 +2488,7 @@ onMounted(() => {
               </button>
               <img
                 v-if="hasCover(book)"
-                v-lazy="coverSrc(book) as string"
+                v-lazy="coverSrc(book, true) as string"
                 class="cover-img"
                 :alt="book.name"
                 loading="lazy"

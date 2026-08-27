@@ -90,6 +90,11 @@ pub fn router(config: crate::AppConfig, storage: Storage) -> axum::Router {
         .route("/book-assets/*rest", get(book_assets))
         // 本地书压缩包内资源按需取用（正文图片不再内联 base64，见 api::book_asset）
         .route("/book-asset", get(crate::api::book_asset::book_asset))
+        // 封面缩略图（书架网格用；按需生成 + 落盘缓存，见 api::cover_thumb）
+        .route(
+            "/cover-thumb/:ns/:file",
+            get(crate::api::cover_thumb::cover_thumb),
+        )
         .route("/epub/*rest", get(epub_asset))
         .route("/health", get(health))
         // Kindle 轻量页（/simple/*：web-simple/ 纯静态——目录请求自动 index.html；
@@ -6119,6 +6124,30 @@ fn book_json_with_group_ids(book: &crate::model::Book) -> serde_json::Value {
                 .collect()
         });
         obj.insert("groupIds".to_string(), serde_json::json!(ids));
+
+        // 缩略图地址（书架网格用；远程/无封面时保持原地址，前端无需判断）
+        let cover = book
+            .custom_cover_url
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .or(book.cover_url.as_deref())
+            .unwrap_or("");
+        let thumb = crate::api::cover_thumb::thumb_url_for(cover)
+            .unwrap_or_else(|| cover.to_string());
+        obj.insert("thumbUrl".to_string(), serde_json::json!(thumb));
+
+        // 元数据完整度（0–100 + 缺失字段），供详情页提示补哪几项。
+        // locked_fields 直接取自本行，不额外查库——书架一次几百本，不能每本再来一次查询。
+        let locked: std::collections::HashSet<String> = book
+            .locked_fields
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        let ms = crate::service::meta_score::score_book(book, &locked);
+        obj.insert("metaScore".to_string(), serde_json::json!(ms.score));
+        obj.insert("metaMissing".to_string(), serde_json::json!(ms.missing));
     }
     v
 }
@@ -22206,6 +22235,94 @@ mod tests {
             .unwrap();
         assert!(locked.contains("name"), "改过的字段应加锁：{locked:?}");
         assert!(!locked.contains("author"), "没改的字段不该加锁：{locked:?}");
+
+        cleanup(state, dir).await;
+    }
+
+    /// 端到端：封面缩略图按需生成 + 落盘缓存 + 路径穿越拒绝
+    #[tokio::test]
+    async fn test_cover_thumb_endpoint() {
+        use tower::ServiceExt as _;
+        let (state, dir) = test_state("coverthumb").await;
+        let covers = state
+            .storage
+            .config
+            .storage_dir()
+            .join("assets")
+            .join("default")
+            .join("covers");
+        std::fs::create_dir_all(&covers).unwrap();
+        // 造一张 800x1200 的大封面（超过缩略图尺寸，必然被缩）
+        let big = {
+            let img = image::RgbImage::from_fn(800, 1200, |x, y| {
+                image::Rgb([(x % 256) as u8, (y % 256) as u8, 128])
+            });
+            let mut out = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(img)
+                .write_to(&mut out, image::ImageFormat::Jpeg)
+                .unwrap();
+            out.into_inner()
+        };
+        std::fs::write(covers.join("c1.jpg"), &big).unwrap();
+
+        let app = axum::Router::new()
+            .route(
+                "/cover-thumb/:ns/:file",
+                get(crate::api::cover_thumb::cover_thumb),
+            )
+            .with_state(state.clone());
+        let fetch = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    axum::http::Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // ① 首次请求：现场生成
+        let resp = fetch("/cover-thumb/default/c1.jpg").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/jpeg");
+        let thumb = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            thumb.len() < big.len(),
+            "缩略图应比原图小（{} vs {}），否则这个端点没有意义",
+            thumb.len(),
+            big.len()
+        );
+        let (w, h) = image::load_from_memory(&thumb)
+            .map(|i| (i.width(), i.height()))
+            .unwrap();
+        assert!(w <= 250 && h <= 350, "实际 {w}x{h}");
+
+        // ② 落盘缓存：文件已生成，第二次直接读盘
+        let cached = covers.join("thumbs").join("c1.jpg");
+        assert!(cached.is_file(), "应落盘缓存到 covers/thumbs/");
+        let resp = fetch("/cover-thumb/default/c1.jpg").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // ③ 不存在的封面 → 404
+        assert_eq!(
+            fetch("/cover-thumb/default/nope.jpg").await.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // ④ 非图片内容 → 生成不了，回退原文件而不是裂图
+        std::fs::write(covers.join("bad.jpg"), b"not an image").unwrap();
+        let resp = fetch("/cover-thumb/default/bad.jpg").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "解码失败应回退原图，书架不能出现裂图"
+        );
 
         cleanup(state, dir).await;
     }
