@@ -15,10 +15,19 @@ export function searchBookMulti(
   page = 1,
   exact = false,
   bookSourceGroup = '',
+  /** 书源类型过滤（0 文本/1 音频/2 漫画/3 文件/4 视频）；省略 = 全类型 */
+  bookSourceType?: number,
 ): Promise<ReturnData<SearchBook[]>> {
   return post<SearchBook[]>(
     '/searchBookMulti',
-    { key, maxSources, page, exact: exact ? 1 : 0, bookSourceGroup },
+    {
+      key,
+      maxSources,
+      page,
+      exact: exact ? 1 : 0,
+      bookSourceGroup,
+      ...(bookSourceType !== undefined ? { bookSourceType } : {}),
+    },
     { signal },
   )
 }
@@ -39,6 +48,8 @@ export interface SearchSSEParams {
   concurrentCount?: number
   /** 精确匹配（exact=1：书名/作者等值，忽略大小写/全半角；缺省模糊 contains） */
   exact?: boolean
+  /** 书源类型过滤（0 文本/1 音频/2 漫画/3 文件/4 视频）；省略 = 全类型 */
+  bookSourceType?: number
 }
 
 export interface SearchSSECallbacks {

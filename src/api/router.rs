@@ -2531,6 +2531,12 @@ async fn search_book_multi(
         .and_then(|v| v.parse().ok())
         .unwrap_or(1i64);
     let mut group = params.get("bookSourceGroup").cloned().unwrap_or_default();
+    // 书源类型过滤（0 文本/1 音频/2 漫画/3 文件/4 视频）：query 优先，body 可覆盖。
+    // 找小说不必去打漫画/音频/文件源，可省下相当比例的请求与等待。缺省 = 全类型。
+    let mut type_filter: Option<i64> = params
+        .get("bookSourceType")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|t| (0..=4).contains(t));
     // P1-4 单源指定：精确匹配 bookSourceUrl（非空时只搜该源）
     let mut single_source_url = params.get("bookSourceUrl").cloned().unwrap_or_default();
     let mut exact = params.get("exact").map(|v| v == "1").unwrap_or(false);
@@ -2548,6 +2554,13 @@ async fn search_book_multi(
             }
             if let Some(v) = json.get("bookSourceGroup").and_then(|v| v.as_str()) {
                 group = v.to_string();
+            }
+            if let Some(t) = json
+                .get("bookSourceType")
+                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .filter(|t| (0..=4).contains(t))
+            {
+                type_filter = Some(t);
             }
             if let Some(v) = json.get("bookSourceUrl").and_then(|v| v.as_str()) {
                 single_source_url = v.to_string();
@@ -2577,12 +2590,14 @@ async fn search_book_multi(
         Ok(s) => s,
         Err(_) => return Json(ReturnData::err("系统错误")),
     };
+    // 类型过滤见上方 type_filter（找小说不必去打漫画/音频/文件源，省下大量请求与等待）
     let mut sources: Vec<crate::model::BookSource> = sources
         .into_iter()
         .filter(|s| s.enabled && s.search_url.is_some())
         .filter(|s| !crate::service::health::is_source_invalid(&namespace, &s.book_source_url))
         .filter(|s| book_source_group_matches(&group, s.book_source_group.as_deref()))
         .filter(|s| single_source_url.is_empty() || s.book_source_url == single_source_url)
+        .filter(|s| type_filter.map(|t| s.book_source_type == t).unwrap_or(true))
         .collect();
     // 防炸：限制搜索源数量（前端按组搜索时通常远小于此）
     if sources.len() > max_sources {
@@ -8327,6 +8342,11 @@ async fn search_book_multi_sse(
         key.remove(0);
     }
     let mut group = params.get("bookSourceGroup").cloned().unwrap_or_default();
+    // 类型过滤（同 searchBookMulti）：query 优先，body 可覆盖
+    let mut type_filter: Option<i64> = params
+        .get("bookSourceType")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|t| (0..=4).contains(t));
     // P1-4 单源指定：精确匹配 bookSourceUrl（非空时只搜该源）
     let mut single_source_url = params.get("bookSourceUrl").cloned().unwrap_or_default();
     let mut exact = params.get("exact").map(|v| v == "1").unwrap_or(false);
@@ -8348,6 +8368,13 @@ async fn search_book_multi_sse(
             }
             if let Some(v) = json.get("bookSourceGroup").and_then(|v| v.as_str()) {
                 group = v.to_string();
+            }
+            if let Some(t) = json
+                .get("bookSourceType")
+                .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                .filter(|t| (0..=4).contains(t))
+            {
+                type_filter = Some(t);
             }
             if let Some(v) = json.get("bookSourceUrl").and_then(|v| v.as_str()) {
                 single_source_url = v.to_string();
@@ -8400,6 +8427,7 @@ async fn search_book_multi_sse(
         })
         .filter(|s| book_source_group_matches(&group, s.book_source_group.as_deref()))
         .filter(|s| single_source_url.is_empty() || s.book_source_url == single_source_url)
+        .filter(|s| type_filter.map(|t| s.book_source_type == t).unwrap_or(true))
         .collect();
     if sources.is_empty() {
         return sse_error(ReturnData::err("未配置书源"));

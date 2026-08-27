@@ -3039,10 +3039,21 @@ function canSwitchSource(): boolean {
 function openSource() {
   sourceOpen.value = true
   document.body.style.overflow = 'hidden'
-  // 默认只搜同类型书源（当前书 type：0 文本/1 音频/2 漫画/3 文件/4 视频）——
-  // 用户可在弹窗内改为「全部类型」
+  // 类型默认值：优先跟随当前书的 type；书上没有再沿用搜索页选的类型
+  // （用户在搜索页选了「小说」，换源自然也只该搜小说源）。都没有则不过滤。
   const t = shelfBook.value?.type
-  sourceTypeFilter.value = typeof t === 'number' && t >= 0 && t <= 4 ? String(t) : ''
+  if (typeof t === 'number' && t >= 0 && t <= 4) {
+    sourceTypeFilter.value = String(t)
+  } else {
+    const saved = (() => {
+      try {
+        return localStorage.getItem('reader_search_source_type')
+      } catch {
+        return null
+      }
+    })()
+    sourceTypeFilter.value = saved !== null && saved !== '' ? saved : ''
+  }
   void runSourceSearch()
 }
 
@@ -3306,11 +3317,18 @@ async function switchSource(r: SearchBook) {
     const toc = tocRes.data
     // 目录确认可用后再落库：bookUrl 也要切到候选源的（否则 origin 与 bookUrl 分属两源）
     if (!isTemp) {
+      // 必须带上书名/作者等身份字段：saveBook 在 bookUrl 变化时按「新书」全量写入，
+      // 不传 name 会把书名清空 → 之后换源报「无法获取书名」（换源需靠书名搜索）
       await saveBook({
         bookUrl: r.bookUrl || b.bookUrl,
         origin: r.origin,
         originName: r.originName,
         tocUrl: nextTocUrl,
+        name: r.name || b.name,
+        author: r.author || b.author,
+        coverUrl: r.coverUrl ?? b.coverUrl ?? null,
+        intro: r.intro ?? b.intro ?? null,
+        type: b.type ?? 0,
       } as Book)
     }
     b.origin = r.origin

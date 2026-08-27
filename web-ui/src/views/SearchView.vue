@@ -51,6 +51,36 @@ async function loadAllSources() {
 void loadAllSources()
 
 const searchGroups = ref<string[]>([])
+/** 搜索的书源类型（''=全部；0 小说/1 音频/2 漫画/3 文件/4 视频）。
+ *  默认「小说」——找小说不必打漫画/音频/文件源，可省下大量请求。
+ *  选择会记住并在换源时沿用（阅读器换源默认按同类型搜） */
+const SEARCH_TYPE_KEY = 'reader_search_source_type'
+const activeSearchType = ref<string>(localStorage.getItem(SEARCH_TYPE_KEY) ?? '0')
+const SEARCH_TYPES: Array<{ v: string; label: string }> = [
+  { v: '', label: '全部' },
+  { v: '0', label: '小说' },
+  { v: '2', label: '漫画' },
+  { v: '1', label: '音频' },
+  { v: '4', label: '视频' },
+  { v: '3', label: '文件' },
+]
+/** 传给后端的类型参数（''→undefined 表示不过滤） */
+function searchTypeArg(): number | undefined {
+  return activeSearchType.value === '' ? undefined : Number(activeSearchType.value)
+}
+function pickSearchType(v: string) {
+  if (activeSearchType.value === v) return
+  activeSearchType.value = v
+  try {
+    localStorage.setItem(SEARCH_TYPE_KEY, v)
+  } catch {
+    /* 隐私模式等：忽略持久化失败 */
+  }
+  // 与分组筛选同样的语义：中止在途搜索后按新类型重搜
+  if (searching.value) stopSearch()
+  const word = key.value.trim()
+  if (searched.value && word) void doSearch(word)
+}
 async function loadSearchGroups() {
   try {
     const res = await getBookSources()
@@ -209,6 +239,7 @@ async function doSearch(kw?: string) {
       {
         key: word,
         bookSourceGroup: activeSearchGroup.value,
+        bookSourceType: searchTypeArg(),
         bookSourceUrl: singleSourceUrl.value || undefined,
         lastIndex: -1,
         searchSize: 50,
@@ -265,6 +296,7 @@ async function runBatch(word: string, seq: number, page = 1) {
       page,
       exact.value,
       activeSearchGroup.value,
+      searchTypeArg(),
     )
     if (seq !== searchSeq) return
     if (!res.isSuccess) {
@@ -309,6 +341,7 @@ async function loadMore() {
       nextPage,
       exact.value,
       activeSearchGroup.value,
+      searchTypeArg(),
     )
     if (seq !== searchSeq) return
     if (!res.isSuccess) throw new Error(res.errorMsg || '加载失败，请稍后重试')
@@ -705,6 +738,21 @@ onBeforeUnmount(() => {
             <option v-for="n in CONCURRENT_OPTIONS" :key="n" :value="n">{{ n }}</option>
           </select>
         </label>
+      </div>
+
+      <!-- 按书源类型搜索：只搜同类源（找小说不必打漫画/音频/文件源），切换即重搜 -->
+      <div class="group-filter type-filter">
+        <button
+          v-for="tp in SEARCH_TYPES"
+          :key="tp.v"
+          class="group-chip"
+          :class="{ active: activeSearchType === tp.v }"
+          type="button"
+          :title="`只搜索${tp.label}类书源`"
+          @click="pickSearchType(tp.v)"
+        >
+          {{ tp.label }}
+        </button>
       </div>
 
       <!-- 按书源分组搜索：胶囊选择，切换后立即重搜 -->
