@@ -27,7 +27,7 @@ import {
   saveCustomFont,
 } from '@/utils/readerFont'
 import ChapterCacheDialog from '@/components/ChapterCacheDialog.vue'
-import { applyHan, getHanMode, type HanMode } from '@/utils/chinese'
+import { applyHan, getHanMode, hanDictReady, type HanMode } from '@/utils/hanMode'
 import { setGlobalHanMode } from '@/utils/hanMode'
 import { DAILY_STATS_KEY, accumulateDaily, parseDailyStats } from '@/utils/dailyStats'
 import { proxyImageUrl } from '@/utils/imageProxy'
@@ -1475,8 +1475,15 @@ watch(hanMode, (v) => {
   saveSetting('reader_han_mode', v)
 })
 const detectTraditional = (text: string): boolean => detectTraditionalFn(text)
-// chinese.ts 的完整转换表检测（更准）
-import { detectTraditional as detectTraditionalFn } from '@/utils/chinese'
+// chinese.ts 的完整转换表检测（更准）；经 hanMode 懒代理——词典未就绪时返回 false
+import { detectTraditional as detectTraditionalFn } from '@/utils/hanMode'
+// 词典是懒加载的：首章内容先于词典到位时，上面的检测拿到 false——
+// 就绪后对当前正文补检一次，否则 auto 模式下首章繁体不会转
+watch(hanDictReady, (ready) => {
+  if (ready && hanMode.value === 'auto' && content.value) {
+    hanTrad.value = detectTraditional(content.value)
+  }
+})
 watch(content, (c) => {
   if (hanMode.value === 'auto') hanTrad.value = detectTraditional(c)
   // 换章/正文变化：页内搜索命中失效 → 清除高亮与计数

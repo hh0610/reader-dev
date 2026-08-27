@@ -275,7 +275,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { applyHan } from '@/utils/chinese'
+import { applyHan } from '@/utils/hanMode'
 import { useHanMode, setGlobalHanMode, syncHanMode } from '@/utils/hanMode'
 import { useRouter } from 'vue-router'
 import TopNav from '@/components/TopNav.vue'

@@ -10,11 +10,23 @@ const mem = new Map<string, string>()
 }
 
 // 必须在设置 localStorage stub 之后导入（模块初始化即读取 reader_han_mode）
-const { hanMode, useHanMode, setGlobalHanMode, hanText, syncHanMode } = await import('./hanMode.ts')
+const { hanMode, useHanMode, setGlobalHanMode, hanText, syncHanMode, ensureHanDict, hanDictReady } =
+  await import('./hanMode.ts')
+
+// 词典懒加载契约：就绪前原样返回（不阻塞渲染），就绪后正常转换。
+// 这条必须在 ensureHanDict() 之前跑，否则测不到「未就绪」分支。
+test('词典就绪前原样返回，就绪后转换', async () => {
+  assert.equal(hanDictReady.value, false, '导入模块不应立即加载词典')
+  assert.equal(hanText('繁體中文'), '繁體中文', '未就绪时原样返回（并已触发后台加载）')
+  await ensureHanDict()
+  assert.equal(hanDictReady.value, true)
+  assert.equal(hanText('繁體中文'), '繁体中文', '就绪后转换生效')
+})
 
 beforeEach(() => mem.clear())
 
-test('默认模式为 auto，且转换简体', () => {
+test('默认模式为 auto，且转换简体', async () => {
+  await ensureHanDict() // 后续测试统一在词典就绪后断言转换结果
   mem.clear()
   syncHanMode()
   assert.equal(hanMode.value, 'auto')
