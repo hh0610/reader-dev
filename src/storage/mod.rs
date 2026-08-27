@@ -1,5 +1,7 @@
 //! 存储层：SQLite（兼容迁移自 legacy 的 JSON storage）
 
+use std::collections::HashSet;
+
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
@@ -763,6 +765,14 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
     // 导入去重：原始文件的稀疏采样指纹（见 service::file_fingerprint）。
     // 旧库为 NULL——不回填，只影响「这本是否能被后续同文件命中」，重导一次即补上。
     ensure_column_typed(&pool, "books", "file_hash", "TEXT").await?;
+    // 元数据字段锁：逗号分隔的字段名，重扫/刷新时跳过（见 BOOK_LOCKABLE_FIELDS）
+    ensure_column_typed(
+        &pool,
+        "books",
+        "locked_fields",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
 
     // P0 跨用户缓存隔离：book_chapters / toc_cache 补 user_namespace 列（旧库 ALTER，新库建表已含）
     ensure_column_typed(
@@ -2344,6 +2354,68 @@ impl Storage {
         Ok(book)
     }
 
+    /// 可加锁的元数据字段（与 patch/JSON 用的 camelCase 键一致）
+    pub const BOOK_LOCKABLE_FIELDS: &'static [&'static str] = &[
+        "name",
+        "author",
+        "intro",
+        "kind",
+        "coverUrl",
+        "language",
+        "publisher",
+        "publishedAt",
+    ];
+
+    /// 读取某本书已锁定的元数据字段集合
+    pub async fn locked_fields(&self, ns: &str, book_url: &str) -> Result<HashSet<String>> {
+        let raw: Option<String> = sqlx::query_scalar(
+            "SELECT locked_fields FROM books WHERE user_namespace = ?1 AND book_url = ?2",
+        )
+        .bind(ns)
+        .bind(book_url)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+        Ok(parse_locked_fields(raw.as_deref()))
+    }
+
+    /// 增删元数据字段锁（lock=true 加锁，false 解锁）。返回锁定后的完整集合。
+    pub async fn set_field_locks(
+        &self,
+        ns: &str,
+        book_url: &str,
+        fields: &[String],
+        lock: bool,
+    ) -> Result<HashSet<String>> {
+        let mut cur = self.locked_fields(ns, book_url).await?;
+        for f in fields {
+            // 只接受白名单字段——否则用户可以往这一列里塞任意文本
+            let Some(known) = Self::BOOK_LOCKABLE_FIELDS
+                .iter()
+                .find(|k| k.eq_ignore_ascii_case(f))
+            else {
+                continue;
+            };
+            if lock {
+                cur.insert((*known).to_string());
+            } else {
+                cur.remove(*known);
+            }
+        }
+        let mut list: Vec<&str> = cur.iter().map(|s| s.as_str()).collect();
+        list.sort_unstable(); // 稳定序：便于比对与测试
+        let joined = list.join(",");
+        sqlx::query(
+            "UPDATE books SET locked_fields = ?3 WHERE user_namespace = ?1 AND book_url = ?2",
+        )
+        .bind(ns)
+        .bind(book_url)
+        .bind(&joined)
+        .execute(&self.pool)
+        .await?;
+        Ok(cur)
+    }
+
     /// 按文件指纹查已导入的本地书（导入去重；见 service::file_fingerprint）。
     /// 只在同一命名空间内查——A 用户导入过的文件不该影响 B 用户的导入。
     pub async fn find_book_by_file_hash(&self, ns: &str, file_hash: &str) -> Result<Option<Book>> {
@@ -2394,16 +2466,32 @@ impl Storage {
         let mut b = book.clone();
         b.user_namespace = ns.to_string();
         // GAP 170 双轨同步：local_file 为服务端内部字段（客户端 saveBook 不带）——
-        // 旧客户端全量覆盖时保留既有文件关联，避免打断文件↔DB 双轨
-        let local_file = if b.local_file.is_some() {
-            b.local_file.clone()
-        } else {
-            self.find_book(ns, &b.book_url)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|old| old.local_file)
+        // 旧客户端全量覆盖时保留既有文件关联，避免打断文件↔DB 双轨。
+        // file_hash / locked_fields 同理：INSERT OR REPLACE 会重置未列出列，
+        // 不显式写回的话，任何一次 saveBook（含阅读进度回写）都会静默清掉
+        // 导入去重指纹与元数据字段锁。
+        let prev = self.find_book(ns, &b.book_url).await.ok().flatten();
+        let local_file = b
+            .local_file
+            .clone()
+            .or_else(|| prev.as_ref().and_then(|o| o.local_file.clone()));
+        let file_hash: Option<String> = match &prev {
+            Some(_) => sqlx::query_scalar(
+                "SELECT file_hash FROM books WHERE user_namespace = ?1 AND book_url = ?2",
+            )
+            .bind(ns)
+            .bind(&b.book_url)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten(),
+            None => None,
         };
+        let locked_fields = prev
+            .as_ref()
+            .map(|o| o.locked_fields.clone())
+            .unwrap_or_default();
         sqlx::query(
             r#"INSERT OR REPLACE INTO books
             (book_url, name, author, origin, origin_name, toc_url, kind, custom_tag, cover_url,
@@ -2415,11 +2503,12 @@ impl Storage {
              display_intro, local_epub, local_pdf, pdf, split_long_chapter,
              last_check_error, info_html, toc_html, language, publisher, published_at,
              user_namespace, created_at, raw_json, local_file, local_file_mtime,
-             local_file_size, local_file_deleted)
+             local_file_size, local_file_deleted, file_hash, locked_fields)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
                     ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
-                    ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53)"#,
+                    ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53,
+                    ?54, ?55)"#,
         )
         .bind(&b.book_url)
         .bind(&b.name)
@@ -2476,6 +2565,8 @@ impl Storage {
         .bind(b.local_file_mtime)
         .bind(b.local_file_size)
         .bind(b.local_file_deleted)
+        .bind(file_hash)
+        .bind(locked_fields)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -3685,21 +3776,30 @@ impl Storage {
         imported: &crate::service::local_book::ImportedBook,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        // INSERT OR REPLACE 会重置未列出列：重导入本地书时保留既有多分组
-        let prev_group_ids: Option<String> = sqlx::query_scalar(
-            "SELECT group_ids FROM books WHERE user_namespace = ?1 AND book_url = ?2",
+        // INSERT OR REPLACE 会重置未列出列：重导入本地书时必须把这些先读出来再写回，
+        // 否则「重导入一次」会静默清掉多分组、导入去重指纹与元数据字段锁。
+        let prev: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT group_ids, file_hash, locked_fields FROM books \
+             WHERE user_namespace = ?1 AND book_url = ?2",
         )
         .bind(ns)
         .bind(&info.book_url)
         .fetch_optional(&mut *tx)
         .await?;
-        let group_ids = prev_group_ids.unwrap_or_else(|| "[]".to_string());
+        let (group_ids, file_hash, locked_fields) = match prev {
+            Some((g, h, l)) => (
+                if g.is_empty() { "[]".to_string() } else { g },
+                h,
+                l.unwrap_or_default(),
+            ),
+            None => ("[]".to_string(), None, String::new()),
+        };
         sqlx::query(
             r#"INSERT OR REPLACE INTO books
             (book_url, name, author, kind, intro, language, publisher, published_at,
              cover_url, toc_url, origin, origin_name, group_name, group_ids, type,
-             total_chapter_num, user_namespace, created_at)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13,?14,?15,?16,?17)"#,
+             total_chapter_num, user_namespace, created_at, file_hash, locked_fields)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,0,?13,?14,?15,?16,?17,?18,?19)"#,
         )
         .bind(&info.book_url)
         .bind(&info.name)
@@ -3718,6 +3818,8 @@ impl Storage {
         .bind(imported.chapters.len() as i64)
         .bind(ns)
         .bind(chrono::Utc::now().timestamp_millis())
+        .bind(file_hash)
+        .bind(locked_fields)
         .execute(&mut *tx)
         .await?;
         let chapters: Vec<(String, String)> = imported
@@ -5607,6 +5709,17 @@ const BOOK_PATCH_COLUMNS: &[(&str, &str)] = &[
 ];
 
 /// 按 JSON value 类型绑定（bool→0/1、数字→int、字符串→text、对象/数组→JSON 文本、null→NULL）
+/// 解析 locked_fields 列（逗号分隔；空白项与未知字段忽略）
+fn parse_locked_fields(raw: Option<&str>) -> HashSet<String> {
+    raw.unwrap_or("")
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .filter(|s| Storage::BOOK_LOCKABLE_FIELDS.contains(s))
+        .map(|s| s.to_string())
+        .collect()
+}
+
 fn push_book_patch_value(qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>, value: &serde_json::Value) {
     match value {
         serde_json::Value::Bool(b) => {
@@ -6417,6 +6530,89 @@ mod tests {
         );
 
         cleanup(storage, "ns").await;
+    }
+
+    /// INSERT OR REPLACE 会重置未列出列：upsert_book / save_local_book 都必须显式写回
+    /// file_hash 与 locked_fields，否则一次 saveBook 或一次重导入就把它们静默清空。
+    #[tokio::test]
+    async fn 指纹与字段锁不被覆盖清空() {
+        let storage = test_storage("keepcols").await;
+        let url = "local://keep-1";
+        let info = crate::model::book_chapter::BookInfo {
+            name: "书".into(),
+            author: "作者".into(),
+            book_url: url.into(),
+            origin: "local".into(),
+            origin_name: "本地书".into(),
+            toc_url: Some(format!("{url}/toc")),
+            ..Default::default()
+        };
+        let imported = crate::service::local_book::ImportedBook {
+            meta: Default::default(),
+            chapters: vec![crate::service::local_book::Chapter {
+                title: "第一章".into(),
+                content: "正文".into(),
+            }],
+            cover: None,
+            format: "txt".into(),
+        };
+        storage
+            .save_local_book("default", &info, &imported)
+            .await
+            .unwrap();
+        storage
+            .set_book_file_hash("default", url, "deadbeef")
+            .await
+            .unwrap();
+        storage
+            .set_field_locks("default", url, &["name".into()], true)
+            .await
+            .unwrap();
+
+        // ① upsert_book（saveBook 走的就是它，含每次进度回写）
+        let mut b = shelf_book(url, "书");
+        b.origin = "local".into();
+        storage.upsert_book("default", &b).await.unwrap();
+        assert!(
+            storage
+                .find_book_by_file_hash("default", "deadbeef")
+                .await
+                .unwrap()
+                .is_some(),
+            "saveBook 后指纹丢失 → 同一文件会被重复导入"
+        );
+        assert!(
+            storage
+                .locked_fields("default", url)
+                .await
+                .unwrap()
+                .contains("name"),
+            "saveBook 后字段锁丢失 → 人工改的书名会被下次重扫盖回去"
+        );
+
+        // ② save_local_book（重导入同一本）
+        storage
+            .save_local_book("default", &info, &imported)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .find_book_by_file_hash("default", "deadbeef")
+                .await
+                .unwrap()
+                .is_some(),
+            "重导入后指纹丢失"
+        );
+        assert!(
+            storage
+                .locked_fields("default", url)
+                .await
+                .unwrap()
+                .contains("name"),
+            "重导入后字段锁丢失"
+        );
+
+        cleanup(storage, "keepcols").await;
     }
 
     /// 构造书架书（默认值 + 关键字段）

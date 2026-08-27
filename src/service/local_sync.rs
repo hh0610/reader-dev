@@ -530,10 +530,26 @@ async fn reparse_and_update(
     if let Some(k) = imported.meta.subjects.first() {
         patch.insert("kind".to_string(), serde_json::json!(k));
     }
+    // 元数据字段锁：用户手工改过的字段不被文件里的值盖回去（见 storage::set_field_locks）
+    let locked = storage
+        .locked_fields(ns, &book.book_url)
+        .await
+        .unwrap_or_default();
+    if !locked.is_empty() {
+        patch.retain(|k, _| !locked.contains(k.as_str()));
+        tracing::debug!(
+            "本地书重扫跳过已锁字段 [{}] {}: {:?}",
+            ns,
+            book.name,
+            locked
+        );
+    }
     let _ = storage.patch_book(ns, &book.book_url, &patch).await;
-    // 封面更新（新封面存在时替换）
+    // 封面更新（新封面存在时替换；封面被手工换过就不动）
     if let Some(cover) = &imported.cover {
-        save_book_cover(storage, ns, &book.book_url, cover).await;
+        if !locked.contains("coverUrl") {
+            save_book_cover(storage, ns, &book.book_url, cover).await;
+        }
     }
     // 更新关联（mtime/大小 + 清除删除标记）
     storage
@@ -825,6 +841,74 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 元数据字段锁：手工改过的字段，文件重扫时不被盖回去
+    #[tokio::test]
+    async fn 字段锁_重扫不覆盖手工修改() {
+        let storage = test_storage("metalock").await;
+        let books_dir = storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join("default")
+            .join(BOOKS_DIR);
+        std::fs::create_dir_all(&books_dir).unwrap();
+        let f = books_dir.join("原名.txt");
+        std::fs::write(&f, "第一章 起\n甲\n第二章 承\n乙\n").unwrap();
+
+        // ① 首次对账导入
+        reconcile_namespace_dirs(&storage, "default", &no_env_dirs(), 0)
+            .await
+            .unwrap();
+        let book = storage
+            .list_books("default")
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("应导入一本");
+        let url = book.book_url.clone();
+
+        // ② 手工改书名与作者并加锁（saveBook 的自动加锁逻辑等价于此处显式调用）
+        let mut patch = serde_json::Map::new();
+        patch.insert("name".into(), serde_json::json!("我改的书名"));
+        patch.insert("author".into(), serde_json::json!("我改的作者"));
+        storage.patch_book("default", &url, &patch).await.unwrap();
+        storage
+            .set_field_locks("default", &url, &["name".into(), "author".into()], true)
+            .await
+            .unwrap();
+
+        // ③ 改文件内容触发重扫（mtime/size 变化）
+        std::fs::write(&f, "第一章 起\n甲甲甲\n第二章 承\n乙乙乙\n第三章 转\n丙\n").unwrap();
+        reconcile_namespace_dirs(&storage, "default", &no_env_dirs(), 0)
+            .await
+            .unwrap();
+
+        let after = storage.find_book("default", &url).await.unwrap().unwrap();
+        assert_eq!(
+            after.name, "我改的书名",
+            "书名已加锁，重扫不该用文件名盖回去"
+        );
+        assert_eq!(after.author, "我改的作者", "作者同上");
+        assert_eq!(
+            after.total_chapter_num, 3,
+            "未加锁的字段（章数）仍应正常更新，否则锁把整个重扫也废了"
+        );
+
+        // ④ 解锁后重扫恢复「以文件为准」
+        storage
+            .set_field_locks("default", &url, &["author".into()], false)
+            .await
+            .unwrap();
+        assert!(!storage
+            .locked_fields("default", &url)
+            .await
+            .unwrap()
+            .contains("author"));
+
+        cleanup(storage, "metalock").await;
     }
 
     /// 写入完成检测：正在写的文件要等，写完的立刻放行，等待中消失的返回 false

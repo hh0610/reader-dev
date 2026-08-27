@@ -8024,6 +8024,32 @@ async fn save_book(
             loc_migrated = true;
         }
     }
+    // 元数据字段锁用的快照：existing/book 在下面的分支里会被移动，先把要比对的值取出来。
+    // 只对本地书生效——书源书这些字段本就随刷新而变，锁了会挡住正常更新。
+    let lock_snapshot: Option<Vec<(String, String, String)>> = existing.as_ref().filter(|ex| {
+        crate::service::local_book::is_local_book(&ex.book_url, &ex.origin)
+    }).map(|ex| {
+        vec![
+            ("name".to_string(), ex.name.clone(), book.name.clone()),
+            ("author".to_string(), ex.author.clone(), book.author.clone()),
+            (
+                "intro".to_string(),
+                ex.intro.clone().unwrap_or_default(),
+                book.intro.clone().unwrap_or_default(),
+            ),
+            (
+                "kind".to_string(),
+                ex.kind.clone().unwrap_or_default(),
+                book.kind.clone().unwrap_or_default(),
+            ),
+            (
+                "coverUrl".to_string(),
+                ex.cover_url.clone().unwrap_or_default(),
+                book.cover_url.clone().unwrap_or_default(),
+            ),
+        ]
+    });
+
     let result = if let Some(ex) = existing {
         // 编辑：按 body 出现的字段增量更新。
         // legacy：saveBook 不允许改进度——dur 三字段以库内为准（客户端走 saveBookProgress）
@@ -8133,11 +8159,50 @@ async fn save_book(
             .map(|_| 1u64)
     };
     match result {
-        Ok(_) => Json(ReturnData::ok(serde_json::Value::Null)),
+        Ok(_) => {
+            // 元数据字段锁（借鉴 booklore 的 *Locked 标记）：本地书的元数据由文件重扫产生，
+            // 用户手工改过的字段不应在下次重扫时被文件里的值盖回去。
+            // 这里按「与库里旧值相比是否变了」自动加锁——前端无需改动，
+            // 而阅读进度同步之类的回写因为值没变，不会误锁。
+            apply_meta_locks(&state, &namespace, &book_url, lock_snapshot).await;
+            Json(ReturnData::ok(serde_json::Value::Null))
+        }
         Err(e) => {
             tracing::error!("saveBook 失败: {e}");
             Json(ReturnData::err("保存失败"))
         }
+    }
+}
+
+/// saveBook 后置：把「用户这次改动过的元数据字段」标记为锁定。
+///
+/// 只对本地书生效——书源书的这些字段本就随书源刷新而变，锁了反而会挡住正常更新。
+/// 新入架（existing 为 None）不加锁：那是导入本身写入的值，不是人工修正。
+async fn apply_meta_locks(
+    state: &AppState,
+    ns: &str,
+    book_url: &str,
+    snapshot: Option<Vec<(String, String, String)>>,
+) {
+    let Some(fields) = snapshot else { return };
+    // 变更判定：新值非空且与旧值不同。空值不算「改动」——前端某些回写只带部分字段，
+    // 用空串把已有简介锁死会很难解释。
+    let changed: Vec<String> = fields
+        .into_iter()
+        .filter(|(_, old, new)| !new.trim().is_empty() && old != new)
+        .map(|(f, _, _)| f)
+        .collect();
+    if changed.is_empty() {
+        return;
+    }
+    if let Err(e) = state
+        .storage
+        .set_field_locks(ns, book_url, &changed, true)
+        .await
+    {
+        tracing::warn!("元数据字段锁写入失败 [{ns}] {book_url}: {e}");
+    } else {
+        tracing::info!("元数据字段已锁定 [{ns}] {book_url}: {}", changed.join(","));
     }
 }
 
@@ -22048,6 +22113,86 @@ mod tests {
         )
         .await;
         assert!(!ret.0.is_success, "提取不到图片应报错");
+
+        cleanup(state, dir).await;
+    }
+
+    /// saveBook 改动本地书元数据 → 自动加锁；进度回写（值未变）不该误锁
+    #[tokio::test]
+    async fn test_save_book_auto_locks_edited_meta() {
+        let (state, dir) = test_state("metalockapi").await;
+        // 先造一本本地书
+        let info = crate::model::book_chapter::BookInfo {
+            name: "文件里的书名".into(),
+            author: "文件里的作者".into(),
+            book_url: "local://lock-1".into(),
+            origin: "local".into(),
+            origin_name: "本地书".into(),
+            toc_url: Some("local://lock-1/toc".into()),
+            ..Default::default()
+        };
+        let imported = crate::service::local_book::ImportedBook {
+            meta: Default::default(),
+            chapters: vec![crate::service::local_book::Chapter {
+                title: "第一章".into(),
+                content: "正文".into(),
+            }],
+            cover: None,
+            format: "txt".into(),
+        };
+        state
+            .storage
+            .save_local_book("default", &info, &imported)
+            .await
+            .unwrap();
+
+        let call = |body: serde_json::Value| {
+            let state = state.clone();
+            async move {
+                save_book(
+                    AxumState(state),
+                    Query(HashMap::new()),
+                    HeaderMap::new(),
+                    Some(Bytes::from(body.to_string())),
+                )
+                .await
+            }
+        };
+
+        // ① 原样回写（值没变）→ 不应加锁，否则每次进度同步都会把字段锁死
+        let ret = call(json!({
+            "bookUrl": "local://lock-1",
+            "name": "文件里的书名",
+            "author": "文件里的作者",
+            "durChapterIndex": 3
+        }))
+        .await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        assert!(
+            state
+                .storage
+                .locked_fields("default", "local://lock-1")
+                .await
+                .unwrap()
+                .is_empty(),
+            "值未变不得加锁——否则进度同步会把元数据全锁死"
+        );
+
+        // ② 改书名 → 只锁 name
+        let ret = call(json!({
+            "bookUrl": "local://lock-1",
+            "name": "我改的书名",
+            "author": "文件里的作者"
+        }))
+        .await;
+        assert!(ret.0.is_success, "{}", ret.0.error_msg);
+        let locked = state
+            .storage
+            .locked_fields("default", "local://lock-1")
+            .await
+            .unwrap();
+        assert!(locked.contains("name"), "改过的字段应加锁：{locked:?}");
+        assert!(!locked.contains("author"), "没改的字段不该加锁：{locked:?}");
 
         cleanup(state, dir).await;
     }

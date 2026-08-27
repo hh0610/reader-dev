@@ -186,6 +186,14 @@ pub struct Book {
     #[serde(skip)]
     #[sqlx(rename = "local_file_deleted")]
     pub local_file_deleted: bool,
+    /// 元数据字段锁（逗号分隔的字段名；见 Storage::BOOK_LOCKABLE_FIELDS）。
+    ///
+    /// 用户手工改过的字段记在这里，本地书重扫时跳过——否则文件里的旧值会把人工修正盖掉。
+    /// **只读**：由服务端在 saveBook 里按「值是否变化」自动维护，
+    /// 客户端 saveBook 传什么都不生效（deserialize 时忽略），避免被误改或清空。
+    #[serde(rename = "lockedFields", skip_deserializing)]
+    #[sqlx(rename = "locked_fields", default)]
+    pub locked_fields: String,
     /// 入库行号（list_books 查询附加——前端"最近添加"排序依据；不参与 JSON 写入；
     /// 其他查询无该列时回落 None）
     #[serde(default, skip_serializing_if = "Option::is_none")]
