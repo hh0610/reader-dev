@@ -107,33 +107,45 @@ async fn resolve_ns(
         .map(|u| u.username)
 }
 
-/// 书 → 原始压缩包路径：优先双轨关联的原文件，其次上传时落盘的 opds_files/{id}.{ext}
+/// 书 → 原始压缩包路径。
+///
+/// **先查 opds_files（上传时落盘的原件），再回退 local_file** —— 顺序不能反。
+/// 双轨同步会给「只有 DB 记录、没有关联文件」的书**自动生成一个 epub** 落到书仓，
+/// 并把 local_file 指向那个生成物。生成的 epub 是按章节文本重建的，内部条目路径
+/// 与原始 EPUB 完全不同，拿它去找 `OEBPS/Images/cover.jpg` 只会 404（实测踩到）。
+/// 正文里的资源地址是按**原始**压缩包的条目写的，所以必须优先回到原件。
 fn archive_path_of(
     state: &AppState,
     ns: &str,
     book: &crate::model::Book,
 ) -> Option<std::path::PathBuf> {
-    if let Some(p) = book.local_file.as_deref().filter(|p| !p.is_empty()) {
-        let pb = std::path::PathBuf::from(p);
-        if pb.is_file() {
-            return Some(pb);
+    if let Some(id) = book.book_url.strip_prefix("local://") {
+        let dir = state
+            .storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join(ns)
+            .join("opds_files");
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_file()
+                    && p.file_stem()
+                        .map(|s| s.to_string_lossy() == id)
+                        .unwrap_or(false)
+                {
+                    return Some(p);
+                }
+            }
         }
     }
-    let id = book.book_url.strip_prefix("local://")?;
-    let dir = state
-        .storage
-        .config
-        .storage_dir()
-        .join("data")
-        .join(ns)
-        .join("opds_files");
-    for e in std::fs::read_dir(dir).ok()?.flatten() {
-        let p = e.path();
-        if p.is_file() && p.file_stem().map(|s| s.to_string_lossy() == id).unwrap_or(false) {
-            return Some(p);
-        }
-    }
-    None
+    // 扫描导入的书（local://store/{hash}）没有 opds_files 副本，原件就是 local_file
+    book.local_file
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file())
 }
 
 /// 从压缩包读取条目（阻塞 IO，调用方放 spawn_blocking）。

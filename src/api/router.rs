@@ -22302,7 +22302,48 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-        // ④ 非图片条目一律拒绝——这个端点不能变成任意读取压缩包内容的通道
+        // ④ 双轨同步会给「DB-only」书生成一个 epub 落书仓并把 local_file 指过去。
+        //    那个生成物是按章节文本重建的，条目路径与原始压缩包完全不同——
+        //    取图必须回到 opds_files 里的原件，否则线上就是全书图片 404（实测踩到）。
+        let fake = state
+            .storage
+            .config
+            .storage_dir()
+            .join("data")
+            .join("default")
+            .join("books");
+        std::fs::create_dir_all(&fake).unwrap();
+        let fake_epub = fake.join("生成物.epub");
+        std::fs::write(&fake_epub, b"PK\x03\x04not-a-real-archive").unwrap();
+        state
+            .storage
+            .link_local_file(
+                "default",
+                &book_url,
+                Some(&fake_epub.to_string_lossy()),
+                1,
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(&url)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "local_file 被双轨同步指向生成物后，仍应回到 opds_files 原件取图"
+        );
+
+        // ⑤ 非图片条目一律拒绝——这个端点不能变成任意读取压缩包内容的通道
         let html = format!(
             "/book-asset?url={}&path={}",
             urlencoding::encode(&book_url),
