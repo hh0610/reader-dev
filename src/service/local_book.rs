@@ -356,7 +356,7 @@ fn ncx_nav_points(xml: &str, ncx_path: &str) -> Vec<(String, String)> {
                             .attributes()
                             .flatten()
                             .find(|a| local(a.key.as_ref()) == "src")
-                            .and_then(|a| a.unescape_value().ok().map(|v| v.trim().to_string()))
+                            .and_then(|a| a.normalized_value(quick_xml::XmlVersion::Implicit1_0).ok().map(|v| v.trim().to_string()))
                             .unwrap_or_default();
                         if let Some(top) = stack.last_mut() {
                             if top.2.is_empty() {
@@ -1918,10 +1918,10 @@ fn pdf_reflow_page(raw: &str) -> String {
                 pending_break = false;
                 continue;
             }
-            // 普通碎片 → 上一段到此为止
+            // 普通碎片 → 上一段到此为止（pending_break 无需复位：下方不再读它，
+            // 循环末尾会按本碎片是否断行重新赋值）
             paras.push(cur.trim().to_string());
             cur = String::new();
-            pending_break = false;
         }
         // 拼接：仅在两侧都是 ASCII 字母数字时补空格（CJK 间不补）
         if let (Some(prev), Some(next)) = (cur.chars().last(), f.chars().next()) {
@@ -3918,6 +3918,7 @@ mod tests {
     /// 构造最小 EPUB（EPUB2：toc.ncx；EPUB3：nav.xhtml）验证六模式：
     /// - spine 顺序 [c1, c2]（标题 第一章/第二章）
     /// - toc.ncx 顺序 [c2, c1]（标题 TOC-2/TOC-1）
+    #[allow(dead_code)] // 上游测试辅助（be309b7 起无调用）——保留以备 EPUB 用例复用
     fn build_test_epub() -> Vec<u8> {
         use std::io::Write;
         let mut buf = std::io::Cursor::new(Vec::new());
@@ -4028,6 +4029,7 @@ mod tests {
         assert_eq!(plain.chapters.len(), 1, "关闭时保持单章");
     }
 
+    #[allow(dead_code)] // 上游测试辅助（be309b7 起无调用）——保留以备 tocUrl 模式用例复用
     fn parse_epub_toc_modes() {
         let bytes = build_test_epub();
         // 默认 spin+toc：spine 顺序，标题用 spine 的（spine 标题非空不覆盖）

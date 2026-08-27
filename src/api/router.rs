@@ -859,7 +859,7 @@ async fn add_user(
     headers: HeaderMap,
     body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
-    let namespace = match resolve_namespace(&state, &params, &headers).await {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
@@ -3547,24 +3547,6 @@ async fn get_book_toc(
             }
         }
     }
-    // F8：目录回写目标（书架书优先按 url 参数命中，其次 toc_url 命中）
-    let shelf_for_write = {
-        let mut found = state
-            .storage
-            .find_book(&namespace, &url_param)
-            .await
-            .ok()
-            .flatten();
-        if found.is_none() {
-            found = state
-                .storage
-                .find_book(&namespace, &toc_url)
-                .await
-                .ok()
-                .flatten();
-        }
-        found
-    };
     if toc_url.is_empty() {
         return Json(ReturnData::err("请输入书籍链接"));
     }
@@ -4962,7 +4944,7 @@ async fn cancel_cache_book(
     headers: HeaderMap,
     body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
-    let namespace = match resolve_namespace(&state, &params, &headers).await {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
@@ -6318,7 +6300,7 @@ async fn get_users(
     body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
     // 需登录（legacy checkAuth）
-    let namespace = match resolve_namespace(&state, &params, &headers).await {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
@@ -6361,7 +6343,7 @@ async fn update_user(
     headers: HeaderMap,
     body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
-    let namespace = match resolve_namespace(&state, &params, &headers).await {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
@@ -6543,7 +6525,7 @@ async fn reset_user_password(
     headers: HeaderMap,
     body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
-    let namespace = match resolve_namespace(&state, &params, &headers).await {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };
@@ -7782,7 +7764,7 @@ async fn save_opds_settings(
     headers: HeaderMap,
     body: Option<axum::body::Bytes>,
 ) -> Json<ReturnData> {
-    let namespace = match resolve_namespace(&state, &params, &headers).await {
+    let _namespace = match resolve_namespace(&state, &params, &headers).await {
         Ok(ns) => ns,
         Err(ret) => return Json(ret),
     };

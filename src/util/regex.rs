@@ -83,6 +83,7 @@ impl RegexCache {
         self.entries.insert(key, (self.clock, re.clone()));
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // 仅测试断言 LRU 容量时使用
     fn len(&self) -> usize {
         self.entries.len()
     }

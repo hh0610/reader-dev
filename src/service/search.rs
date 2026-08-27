@@ -437,6 +437,7 @@ fn apply_body_js(
 
 /// 并发率（legado concurrentRate）：纯数字 = 每次请求前 sleep 该毫秒；
 /// `n/window`（如 20/60000）→ 每次请求间隔 window/n 毫秒
+#[cfg_attr(not(test), allow(dead_code))] // 仅测试调用（并发率解析用例）
 pub(crate) fn concurrent_rate_sleep_ms(rate: Option<&str>) -> u64 {
     let Some(rate) = rate else { return 0 };
     let rate = rate.trim();
@@ -795,6 +796,7 @@ pub(crate) fn analyze_book_list_for_explore(
 }
 
 /// 解析书单（对齐 legacy BookList.analyzeBookList v1：无 JS/无变量）
+#[cfg_attr(not(test), allow(dead_code))] // 仅测试调用（真实书源 JSON 用例）
 fn analyze_book_list(
     ns: &str,
     body: &str,
@@ -1103,6 +1105,7 @@ fn css_items(rule: &str, body: &str) -> Vec<String> {
 }
 
 /// URL 型字段规则（legado isUrl 语义）：展开内嵌后若是路径/URL 直接拼接，否则走规则解析
+#[allow(dead_code)] // legado 规则面对齐保留；master 起即无调用（盘点 2026-08-27）
 fn field_url(context: &str, rule: Option<&str>, default: &str, base: &str) -> String {
     field_url_impl(context, rule, default, base, None)
 }
@@ -1168,6 +1171,7 @@ fn field_url_impl(
 }
 
 /// 展开 {{$.xxx}} 内嵌规则（legado：{{}} 内为 JSONPath/JS，v1 支持 JSONPath）
+#[allow(dead_code)] // legado 规则面对齐保留；master 起即无调用（盘点 2026-08-27）
 pub(crate) fn expand_embedded(rule: &str, context: &str) -> String {
     expand_embedded_impl(rule, context, None)
 }
@@ -1232,6 +1236,7 @@ pub(crate) fn field(context: &str, rule: Option<&str>, default: &str) -> String 
 }
 
 /// 字段规则应用（带书源桥接：搜索流程共享 ns bridge，java.* 可用）
+#[allow(dead_code)] // 调用点被本分支重构移除；保留与 field/field_impl 家族对称（盘点 2026-08-27）
 pub(crate) fn field_with_bridge(
     context: &str,
     rule: Option<&str>,
@@ -1426,10 +1431,12 @@ fn collect_visible_text(el: scraper::ElementRef<'_>) -> String {
     s.trim().to_string()
 }
 
+#[allow(dead_code)] // opt_field 家族当前无调用，保留对齐面（盘点 2026-08-27）
 pub(crate) fn opt_field(context: &str, rule: Option<&str>) -> Option<String> {
     opt_field_with_bridge(context, rule, None)
 }
 
+#[allow(dead_code)] // 同上（盘点 2026-08-27）
 pub(crate) fn opt_field_with_bridge(
     context: &str,
     rule: Option<&str>,

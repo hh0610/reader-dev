@@ -3786,6 +3786,7 @@ fn java_android_id(
 }
 
 /// java.base64Encode(str)
+#[allow(dead_code)] // legado java.base64* 对齐保留；master 起即无调用（盘点 2026-08-27）
 fn java_base64_encode(
     _inner: &JsBridgeInner,
     args: &[JsValue],
@@ -3927,7 +3928,7 @@ fn java_digest_base64_str(
 fn java_log_type(
     _inner: &JsBridgeInner,
     args: &[JsValue],
-    context: &mut Context,
+    _context: &mut Context,
 ) -> JsResult<JsValue> {
     let v = args.get_or_undefined(0);
     let t = if v.is_null() {
@@ -3950,6 +3951,7 @@ fn java_log_type(
 }
 
 /// java.base64DecodeToString(str)
+#[allow(dead_code)] // legado java.base64* 对齐保留；master 起即无调用（盘点 2026-08-27）
 fn java_base64_decode(
     _inner: &JsBridgeInner,
     args: &[JsValue],

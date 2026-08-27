@@ -279,7 +279,7 @@ fn attr_of(e: &quick_xml::events::BytesStart<'_>, want: &str) -> Option<String> 
     for attr in e.attributes().flatten() {
         if local_name(attr.key.as_ref()) == want {
             return attr
-                .unescape_value()
+                .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .ok()
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty());
@@ -325,44 +325,6 @@ pub(crate) fn extract_all_tags(xml: &str, tag: &str) -> Vec<String> {
         rest = &after[gt + 1 + end + close.len()..];
     }
     out
-}
-
-/// 提取带属性条件的标签 href：<item id="cover" href="...">
-fn extract_attr(
-    xml: &str,
-    tag: &str,
-    attr_key: &str,
-    attr_val: &str,
-    want: &str,
-) -> Option<String> {
-    let mut rest = xml;
-    loop {
-        let Some(start) = rest.find(&format!("<{tag}")) else {
-            return None;
-        };
-        let after = &rest[start..];
-        let Some(gt) = after.find('>') else {
-            return None;
-        };
-        let tag_block = &after[..gt + 1];
-        // 检查 attr_key="attr_val"（宽容：引号单双）
-        let pattern_attr = format!("{attr_key}=\"{attr_val}\"");
-        let pattern_attr2 = format!("{attr_key}='{attr_val}'");
-        if tag_block.contains(&pattern_attr) || tag_block.contains(&pattern_attr2) {
-            let want_pattern = format!("{want}=\"");
-            let want_pattern2 = format!("{want}='");
-            if let Some(i) = tag_block.find(&want_pattern) {
-                let rest2 = &tag_block[i + want_pattern.len()..];
-                return rest2.split('"').next().map(str::to_string);
-            }
-            if let Some(i) = tag_block.find(&want_pattern2) {
-                let rest2 = &tag_block[i + want_pattern2.len()..];
-                return rest2.split('\'').next().map(str::to_string);
-            }
-            return None;
-        }
-        rest = &after[gt + 1..];
-    }
 }
 
 /// HTML/XML 实体解码（常用）

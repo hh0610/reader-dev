@@ -1037,6 +1037,7 @@ fn apply_rule_inner(
 /// - 提取失败 / JS 报错 / 结果为空 → 替换为空串；未闭合的 `{{` → 原样返回
 ///
 /// 注意：JS 字符串内若含 `}}` 会提前截断（v1 限制，规则 JS 避免字面 `}}`）
+#[cfg_attr(not(test), allow(dead_code))] // 仅测试调用（内嵌规则深度用例）
 fn expand_inline_depth(body: &str, text: &str, depth: usize) -> String {
     expand_inline_depth_checked(body, text, depth, None).0
 }

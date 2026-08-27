@@ -217,7 +217,7 @@ fn read_archive_entry(archive: &std::path::Path, entry: &str) -> Option<Vec<u8>>
     let file = std::fs::File::open(archive).ok()?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file)).ok()?;
     let idx = crate::service::local_book::zip_index_of_pub(&mut zip, entry)?;
-    let mut f = zip.by_index(idx).ok()?;
+    let f = zip.by_index(idx).ok()?;
     if f.size() > MAX_ASSET_BYTES {
         return None;
     }
