@@ -261,39 +261,44 @@ pub fn edge_voices() -> &'static [EdgeVoice] {
 pub const DEFAULT_VOICE: &str = "zh-CN-XiaoxiaoNeural";
 /// 单次合成文本上限（字符）
 pub const MAX_TEXT_CHARS: usize = 20_000;
-/// 单请求块上限（字符；超过按句切块多次合成）
-pub const CHUNK_MAX_CHARS: usize = 2_500;
+/// 单请求块上限（字符；超过按句切块多次合成）。
+/// 对齐 edge-tts：官方按 **4096 字节** 分块（≈1365 个 CJK 字符）。此前取 2500 字
+/// （≈7500 字节）——单会话要传近官方两倍的载荷，实测官方合成 2500 字全程要 38 秒，
+/// 我们的单块 30s 超时对这种块型必超，表现为整章「合成失败」。
+/// 1200 字 ≈ 3600 字节，落在官方粒度内，单会话实测几秒。
+pub const CHUNK_MAX_CHARS: usize = 1_200;
 
 /// 微软 Edge 语音鉴权 token（固定 TrustedClientToken）
 const TRUSTED_CLIENT_TOKEN: &str = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
-/// FILETIME 偏移：1601-01-01 → 1970-01-01 的 100ns 间隔数
-const FILETIME_EPOCH_OFFSET_TICKS: i64 = 116_444_736_000_000_000;
 /// WSS 端点
 const EDGE_WSS_URL: &str =
     "wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1";
 /// 输出音频格式（MP3）
 const OUTPUT_FORMAT: &str = "audio-24khz-48kbitrate-mono-mp3";
 
-/// 生成 Sec-MS-GEC 鉴权 token（.NET FILETIME 小端十六进制；与 edge-tts 算法一致）
-/// 返回 (Sec-MS-GEC, Sec-MS-GEC-Version)
+/// Sec-MS-GEC-Version 用的 Chromium 完整版本号（与 edge-tts 7.2.8 constants.py 同步；
+/// UA 主版本由它派生）。**微软会拒绝过旧的版本号**——实测 130 全线 403、143 放行，
+/// 若日后再次 403 且 GEC 算法未变，优先怀疑该值过期，对照 edge-tts 最新 constants 更新。
+const CHROMIUM_FULL_VERSION: &str = "143.0.3650.75";
+/// 1601-01-01 → 1970-01-01 的秒数（Windows 纪元偏移）
+const WIN_EPOCH_SECS: i64 = 11_644_473_600;
+
+/// 生成 Sec-MS-GEC 鉴权 token（edge-tts drm.py 同款算法）：
+/// 1601 纪元秒 → **向下取整到 5 分钟** → ×10^7 变 100ns ticks →
+/// 十进制字符串拼 TrustedClientToken → SHA-256 → 大写十六进制。
+/// Version 固定为 `1-{Chromium 版本}`。
+///
+/// 旧实现是「裸 ticks 的小端十六进制」——没取整、没哈希、Version 也是臆造的
+/// 日期编码，微软侧必然 403（实测）。注释却写着「与 edge-tts 算法一致」，
+/// 对照 edge-tts 源码后整个重写。
 pub fn sec_ms_gec_at(unix_secs: i64) -> (String, String) {
-    let ticks = unix_secs * 10_000_000 + FILETIME_EPOCH_OFFSET_TICKS;
-    let stamp = ticks
-        .to_le_bytes()
-        .iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<String>();
-    // Version：次日日期整数（YYYYMMDD+1）编码为 FILETIME 样式（edge-tts 同款算法）
-    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(unix_secs, 0)
-        .unwrap_or_else(|| chrono::DateTime::from_timestamp(0, 0).unwrap());
-    let date_int: i64 = dt.format("%Y%m%d").to_string().parse().unwrap_or(19700101);
-    let ticks_v = (date_int + 1) * 10_000_000 + FILETIME_EPOCH_OFFSET_TICKS;
-    let stamp_v = ticks_v
-        .to_le_bytes()
-        .iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<String>();
-    (stamp, stamp_v)
+    use sha2::{Digest, Sha256};
+    let mut secs = unix_secs + WIN_EPOCH_SECS;
+    secs -= secs.rem_euclid(300); // 5 分钟桶：同一桶内 token 相同（服务端按桶校验）
+    let ticks = (secs as i128) * 10_000_000;
+    let hash = Sha256::digest(format!("{ticks}{TRUSTED_CLIENT_TOKEN}").as_bytes());
+    let gec = hash.iter().map(|b| format!("{b:02X}")).collect::<String>();
+    (gec, format!("1-{CHROMIUM_FULL_VERSION}"))
 }
 
 /// 当前时间生成 Sec-MS-GEC
@@ -504,7 +509,8 @@ pub async fn edge_synthesize(
     let mut audio = Vec::new();
     for chunk in chunks {
         let chunk_audio = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            // 60s：1200 字的会话正常几秒，此上限只为兜住网络抖动，不再是常态可触的值
+            std::time::Duration::from_secs(60),
             edge_synthesize_chunk(&chunk, voice, rate, pitch, volume, style),
         )
         .await
@@ -526,16 +532,36 @@ async fn edge_synthesize_chunk(
     let connection_id = uuid::Uuid::new_v4();
     let url = edge_wss_url(&connection_id.to_string());
 
-    let request = http::Request::builder()
-        .uri(&url)
-        .header("Pragma", "no-cache")
-        .header("Cache-Control", "no-cache")
-        .header(
-            "Origin",
-            "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold",
-        )
-        .body(())
+    // 必须经 IntoClientRequest 生成基础握手请求：手工 http::Request::builder 构造时
+    // tungstenite **不会**补 WebSocket 升级头（Host/Upgrade/Connection/
+    // Sec-WebSocket-Key/-Version），服务端直接拒绝握手
+    // （实测报 "Missing, duplicated or incorrect header sec-websocket-key"）。
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+    let mut request = url
+        .as_str()
+        .into_client_request()
         .map_err(|e| anyhow!("构造 WSS 请求失败: {e}"))?;
+    {
+        let h = request.headers_mut();
+        let hv = |v: &str| http::HeaderValue::from_str(v).map_err(|e| anyhow!("非法头值: {e}"));
+        h.insert("Pragma", hv("no-cache")?);
+        h.insert("Cache-Control", hv("no-cache")?);
+        h.insert(
+            "Origin",
+            hv("chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold")?,
+        );
+        // edge-tts 同款 UA（主版本随 CHROMIUM_FULL_VERSION 派生，避免与 GEC-Version 脱节）
+        let major = CHROMIUM_FULL_VERSION.split('.').next().unwrap_or("143");
+        h.insert(
+            "User-Agent",
+            hv(&format!(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0"
+            ))?,
+        );
+        // edge-tts BASE_HEADERS 同款：官方握手带这两个头，保持一致减少被指纹拒绝的面
+        h.insert("Accept-Encoding", hv("gzip, deflate, br, zstd")?);
+        h.insert("Accept-Language", hv("en-US,en;q=0.9")?);
+    }
 
     let (ws, _resp) = tokio_tungstenite::connect_async(request)
         .await
@@ -925,30 +951,32 @@ mod tests {
         );
     }
 
-    /// Sec-MS-GEC：已知时刻的确定性输出（16 位大写十六进制）
+    /// Sec-MS-GEC：edge-tts drm.py 同款算法（SHA-256 大写 + 5 分钟桶 + 固定 Version）
     #[test]
     fn test_sec_ms_gec() {
-        let (stamp, stamp_v) = sec_ms_gec_at(0);
-        assert_eq!(stamp.len(), 16);
-        assert_eq!(stamp_v.len(), 16);
-        assert!(stamp
+        let (gec, ver) = sec_ms_gec_at(0);
+        assert_eq!(gec.len(), 64, "SHA-256 十六进制应为 64 位");
+        assert!(gec
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
-        assert!(stamp_v
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+        assert_eq!(ver, format!("1-{CHROMIUM_FULL_VERSION}"));
         assert_eq!(sec_ms_gec_at(0), sec_ms_gec_at(0), "同一时刻输出应确定");
-        // unix=0 → FILETIME 偏移量本体
-        assert_eq!(
-            stamp,
-            116444736000000000i64
-                .to_le_bytes()
-                .iter()
-                .map(|b| format!("{b:02X}"))
-                .collect::<String>()
-        );
-        // Version 基于次日日期，应大于 Stamp 数值编码
-        assert_ne!(stamp, stamp_v);
+        // 与 edge-tts 算法对照的已知向量：unix=0 → 1601 纪元秒 11644473600
+        // （恰为 300 的倍数，取整不变）→ ticks=116444736000000000 →
+        // SHA256("116444736000000000" + TOKEN)
+        {
+            use sha2::{Digest, Sha256};
+            let expect = Sha256::digest(
+                format!("116444736000000000{TRUSTED_CLIENT_TOKEN}").as_bytes(),
+            )
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<String>();
+            assert_eq!(gec, expect);
+        }
+        // 5 分钟桶：桶内相同、跨桶不同（服务端按桶校验，取整错了就是 403）
+        assert_eq!(sec_ms_gec_at(100).0, sec_ms_gec_at(299).0, "同桶应同 token");
+        assert_ne!(sec_ms_gec_at(299).0, sec_ms_gec_at(300).0, "跨桶应变化");
         // WSS URL 含鉴权参数
         let url = edge_wss_url("conn-1");
         assert!(url.starts_with(

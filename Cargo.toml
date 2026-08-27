@@ -41,7 +41,9 @@ boa_engine = "0.19"       # JS 引擎（纯 Rust，书源 JS 规则）
 feed-rs = "1"
 
 # Edge TTS（微软语音 WebSocket 合成）
-tokio-tungstenite = "0.24"
+# rustls 与 reqwest 同栈（musl 静态编译不能引 OpenSSL）；不开 TLS 特性时连 wss:// 直接报
+# "TLS support not compiled in"——Edge TTS 全线 wss，等于听书整个不可用（实测踩到）
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 # 工具
 # 系统监控（服务监控页：真实内存/CPU——Windows 不再全 0M；默认 features 含进程/CPU 采样）
