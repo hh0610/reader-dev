@@ -872,6 +872,19 @@ pub async fn init(config: &AppConfig) -> Result<Storage> {
         .execute(&pool)
         .await?;
 
+    // 高频查询索引（幂等）。EXPLAIN QUERY PLAN 实测这三条此前在全表扫描：
+    // - find_book_by_file_hash：每次上传的导入去重
+    // - find_book_by_name_author：每次 saveBook 的换源判重
+    // - get_book_sources：每次搜索/换源按命名空间取书源
+    // 书架几十本时无感，几百本 + 多用户时线性劣化。其余高频路径已由主键自动索引覆盖。
+    for ddl in [
+        "CREATE INDEX IF NOT EXISTS idx_books_ns_hash ON books(user_namespace, file_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_books_ns_name_author ON books(user_namespace, name, author)",
+        "CREATE INDEX IF NOT EXISTS idx_book_sources_ns ON book_sources(user_namespace)",
+    ] {
+        sqlx::query(ddl).execute(&pool).await?;
+    }
+
     tracing::info!("storage initialized at {}", db_path.display());
 
     // JSON → SQLite 迁移（幂等：users 表非空跳过）
@@ -6552,6 +6565,39 @@ mod tests {
         );
 
         cleanup(storage, "ns").await;
+    }
+
+    /// 高频查询索引：启动即建（幂等），且查询计划确实走索引而非全表扫描
+    #[tokio::test]
+    async fn 高频查询走索引() {
+        let storage = test_storage("indexes").await;
+        for (sql, idx) in [
+            (
+                "EXPLAIN QUERY PLAN SELECT * FROM books WHERE user_namespace='a' AND file_hash='x'",
+                "idx_books_ns_hash",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT * FROM books WHERE user_namespace='a' AND name='n' AND author='au'",
+                "idx_books_ns_name_author",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT * FROM book_sources WHERE user_namespace='a'",
+                "idx_book_sources_ns",
+            ),
+        ] {
+            let plans: Vec<(i64, i64, i64, String)> =
+                sqlx::query_as(sql).fetch_all(&storage.pool).await.unwrap();
+            let detail = plans
+                .iter()
+                .map(|(_, _, _, d)| d.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            assert!(
+                detail.contains(idx),
+                "应走 {idx}，实际计划：{detail}（全表扫描说明索引没建或没被采用）"
+            );
+        }
+        cleanup(storage, "indexes").await;
     }
 
     /// book_vars_cache 保留期清理（此前只写不清、永久增长）
