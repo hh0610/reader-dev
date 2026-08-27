@@ -1,7 +1,11 @@
 import { createApp } from 'vue'
 import { createPinia } from 'pinia'
-import ElementPlus from 'element-plus'
-import 'element-plus/dist/index.css'
+// element-plus 实际只用 ElMessage/ElMessageBox 两个命令式 API（模板零 <el-*> 组件，
+// 盘点 2026-08-27 全仓核实）——此前全量注册 + 全量 CSS（约 340KB gzip JS + 51KB CSS）
+// 纯属浪费。改为：各处 named import 交给 tree-shaking 收窄；样式按需引入
+// （message-box 的 style/css 入口会自动带上它依赖的 button/input/overlay 等样式）。
+import 'element-plus/es/components/message/style/css'
+import 'element-plus/es/components/message-box/style/css'
 import 'element-plus/theme-chalk/dark/css-vars.css'
 
 import App from './App.vue'
@@ -35,7 +39,6 @@ if (typeof document !== 'undefined' && 'fonts' in document) {
 const app = createApp(App)
 app.use(createPinia())
 app.use(router)
-app.use(ElementPlus)
 app.directive('lazy', lazy)
 app.mount('#app')
 
