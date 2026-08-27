@@ -207,8 +207,33 @@ pub fn build_epub_full(
         let chapter_hrefs: Vec<String> = (0..chapters.len())
             .map(|i| format!("chap_{i:04}.xhtml"))
             .collect();
+        // 正文里「整行一张图」的 markdown 预扫描：必须在写 OPF 之前完成，
+        // 否则图片条目进不了 manifest（严格阅读器/epubcheck 会判不合规）。
+        // 顺序与下面渲染章节时的遍历顺序一致，故可按序号一一对应。
+        let planned_images: Vec<(String, &'static str, Vec<u8>)> = chapters
+            .iter()
+            .flat_map(|ch| ch.content.lines())
+            .filter_map(parse_image_line)
+            .enumerate()
+            .map(|(n, (_alt, bytes, ext))| {
+                let mime = match ext {
+                    "png" => "image/png",
+                    "gif" => "image/gif",
+                    "webp" => "image/webp",
+                    "bmp" => "image/bmp",
+                    _ => "image/jpeg",
+                };
+                (format!("img_{n:04}.{ext}"), mime, bytes)
+            })
+            .collect();
+
         let mut manifest = String::new();
         let mut spine = String::new();
+        for (n, (name, mime, _)) in planned_images.iter().enumerate() {
+            manifest.push_str(&format!(
+                "    <item id=\"img{n}\" href=\"{name}\" media-type=\"{mime}\"/>\n"
+            ));
+        }
         for (i, href) in chapter_hrefs.iter().enumerate() {
             manifest.push_str(&format!(
                 "    <item id=\"chap{i}\" href=\"{href}\" media-type=\"application/xhtml+xml\"/>\n"
@@ -403,7 +428,8 @@ pub fn build_epub_full(
             }
         }
 
-        // 4. 章节 XHTML（spine 顺序）
+        // 4. 章节 XHTML（spine 顺序）；整行图片内嵌为 <img>（条目已在 manifest 中登记）
+        let mut img_cursor = 0usize;
         for (i, ch) in chapters.iter().enumerate() {
             let mut xhtml = String::new();
             xhtml.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
@@ -417,6 +443,17 @@ pub fn build_epub_full(
                 xhtml.push_str(&format!("<h1>{}</h1>\n", escape_xml(ch.title.trim())));
             }
             for para in ch.content.lines().filter(|l| !l.trim().is_empty()) {
+                if let Some((alt, _, _)) = parse_image_line(para) {
+                    if let Some((name, _, _)) = planned_images.get(img_cursor) {
+                        img_cursor += 1;
+                        xhtml.push_str(&format!(
+                            "<p><img src=\"{}\" alt=\"{}\"/></p>\n",
+                            escape_xml(name),
+                            escape_xml(&alt)
+                        ));
+                        continue;
+                    }
+                }
                 xhtml.push_str(&format!("<p>{}</p>\n", escape_xml(para.trim())));
             }
             xhtml.push_str("</body>\n</html>\n");
@@ -425,9 +462,48 @@ pub fn build_epub_full(
             zip.write_all(xhtml.as_bytes()).expect("write chapter");
         }
 
+        // 图片字节落盘（已压缩格式用 Stored，避免二次压缩白费 CPU）
+        for (name, _, bytes) in &planned_images {
+            if zip.start_file(format!("OEBPS/{name}"), stored).is_ok() {
+                let _ = zip.write_all(bytes);
+            }
+        }
+
         zip.finish().expect("finish zip");
     }
     buf
+}
+
+/// 识别「整行就是一张图」的正文行：`![alt](data:image/jpeg;base64,....)`。
+///
+/// 本地书正文用这种 markdown 记图片。导出此前把整行当**普通文本**转义进 `<p>`——
+/// 于是导出的 EPUB 里是几 MB 肉眼可见的 base64 乱码，图片一张也没有。
+/// 这里解析出来真正内嵌成 `<img>`。
+///
+/// 非 data URI（例如指向本服务资源端点的地址）返回 None：那种地址离开本服务就取不到，
+/// 调用方应在导出前先还原成 data URI（见 api::book_asset::inline_asset_urls）。
+fn parse_image_line(line: &str) -> Option<(String, Vec<u8>, &'static str)> {
+    use base64::Engine;
+    let line = line.trim();
+    let rest = line.strip_prefix("![")?;
+    let (alt, rest) = rest.split_once("](")?;
+    let url = rest.strip_suffix(')')?.trim();
+    let payload = url.strip_prefix("data:")?;
+    let (mime, b64) = payload.split_once(";base64,")?;
+    let ext = match mime {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        _ => "jpg",
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    Some((alt.to_string(), bytes, ext))
 }
 
 /// XML 转义（& < > " '）
@@ -564,6 +640,77 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn 导出epub内嵌整行图片() {
+        use base64::Engine as _;
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52,
+        ];
+        let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+        let chs = vec![
+            ExportChapter {
+                title: "彩页".into(),
+                content: format!("![封面]({})", format!("data:image/png;base64,{b64}")),
+            },
+            ExportChapter {
+                title: "正文".into(),
+                content: "普通段落\n另一段".into(),
+            },
+        ];
+        let bytes = build_epub_full("书", "作者", &EpubMeta::default(), &chs);
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        let names: Vec<String> = zip.file_names().map(|s| s.to_string()).collect();
+
+        // ① 图片落成独立条目（不再是几 MB 肉眼可见的 base64 文本）
+        assert!(
+            names.iter().any(|n| n == "OEBPS/img_0000.png"),
+            "图片应落成 zip 条目: {names:?}"
+        );
+        // ② 条目必须登记进 manifest，否则严格阅读器/epubcheck 判不合规
+        let opf = {
+            let mut f = zip.by_name("OEBPS/content.opf").expect("应有 OPF");
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        assert!(
+            opf.contains("href=\"img_0000.png\"") && opf.contains("media-type=\"image/png\""),
+            "图片条目应在 manifest 中: {opf}"
+        );
+        // ③ 章节里是 <img> 而不是转义后的 markdown 文本
+        let chap = {
+            let mut f = zip.by_name("OEBPS/chap_0000.xhtml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        assert!(chap.contains("<img src=\"img_0000.png\""), "{chap}");
+        assert!(!chap.contains("base64,"), "不应再把 base64 当文本塞进正文: {chap}");
+        // ④ 普通段落不受影响
+        let chap2 = {
+            let mut f = zip.by_name("OEBPS/chap_0001.xhtml").unwrap();
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut f, &mut s).unwrap();
+            s
+        };
+        assert!(chap2.contains("<p>普通段落</p>"), "{chap2}");
+    }
+
+    #[test]
+    fn 图片行解析_只认整行data_uri() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3, 4]);
+        assert!(parse_image_line(&format!("![x](data:image/jpeg;base64,{b64})")).is_some());
+        // 非 data URI（资源端点地址）不在此处处理——导出前应先还原
+        assert!(parse_image_line("![x](/book-asset?url=a&path=b.jpg)").is_none());
+        // 前后有文字的不算「整行一张图」
+        assert!(parse_image_line(&format!("看图：![x](data:image/jpeg;base64,{b64})")).is_none());
+        assert!(parse_image_line("普通文本").is_none());
+        // 空 base64 → None（避免写出 0 字节条目）
+        assert!(parse_image_line("![x](data:image/jpeg;base64,)").is_none());
+    }
+
     use super::*;
     use std::io::Read;
 

@@ -107,6 +107,68 @@ async fn resolve_ns(
         .map(|u| u.username)
 }
 
+/// 把正文里指向本服务资源端点的图片地址还原成 data URI（导出/生成 epub 用）。
+///
+/// 正文里的 `![alt](/book-asset?url=..&path=..)` 只在本服务内有效——导出的 EPUB
+/// 拿到别处打开就是一张取不到的图。导出前在这里读回原始字节内嵌回去，
+/// 导出物因此重新变成自包含的（顺带修好了一个更早就存在的问题：
+/// 导出此前把整行 base64 当**普通文本**塞进 `<p>`，图片一张都没有）。
+///
+/// 找不到原文件/条目时保留原样，不让导出整体失败。
+pub fn inline_asset_urls(
+    state: &AppState,
+    ns: &str,
+    book: &crate::model::Book,
+    content: &str,
+) -> String {
+    if !content.contains("/book-asset?") {
+        return content.to_string();
+    }
+    let Some(archive) = archive_path_of(state, ns, book) else {
+        return content.to_string();
+    };
+    use base64::Engine;
+    content
+        .lines()
+        .map(|line| {
+            let Some(entry) = entry_of_asset_line(line) else {
+                return line.to_string();
+            };
+            let Some(mime) = crate::service::local_book::image_mime_pub(&entry) else {
+                return line.to_string();
+            };
+            match read_archive_entry(&archive, &entry) {
+                Some(bytes) => {
+                    let alt = line
+                        .trim()
+                        .strip_prefix("![")
+                        .and_then(|r| r.split_once("]("))
+                        .map(|(a, _)| a)
+                        .unwrap_or("图片");
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    format!("![{alt}](data:{mime};base64,{b64})")
+                }
+                None => line.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 从 `![alt](/book-asset?url=..&path=..)` 取出条目路径（非该形态返回 None）
+fn entry_of_asset_line(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("![")?;
+    let (_, rest) = rest.split_once("](")?;
+    let url = rest.strip_suffix(')')?.trim();
+    let query = url.strip_prefix("/book-asset?")?;
+    for kv in query.split('&') {
+        if let Some(v) = kv.strip_prefix("path=") {
+            return urlencoding::decode(v).ok().map(|c| c.into_owned());
+        }
+    }
+    None
+}
+
 /// 书 → 原始压缩包路径。
 ///
 /// **先查 opds_files（上传时落盘的原件），再回退 local_file** —— 顺序不能反。

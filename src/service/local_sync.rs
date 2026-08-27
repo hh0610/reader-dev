@@ -609,6 +609,9 @@ async fn generate_epub_for_book(
         font: crate::service::export_book::EmbedFont::None,
     };
     let bytes = build_epub_full(&book.name, &book.author, &meta, &chapters);
+    // 说明：这里生成的 epub 供书仓展示/外部阅读器使用。章节正文里若含资源端点地址，
+    // build_epub_full 无法解析（它拿不到原文件），生成物就不会带图。
+    // 这类书（local:// 且无关联文件）本就没有原文件可回溯，属于既有限制。
     // 文件名：{书名}.epub（冲突加后缀）
     let mut fname = sanitize_filename(&book.name);
     if fname.is_empty() {

@@ -4269,11 +4269,19 @@ async fn export_book(
     if chapters.is_empty() {
         return Json(ReturnData::err("没有可导出的章节")).into_response();
     }
+    // 本地书正文里的图片是指向本服务资源端点的地址，导出前还原成内嵌字节——
+    // 否则导出的 EPUB 拿到别处打开，图片全是取不到的外链
+    let export_book_row = state.storage.find_book(&namespace, &url).await.ok().flatten();
     let export_chapters: Vec<crate::service::export_book::ExportChapter> = chapters
         .iter()
         .map(|(t, c)| crate::service::export_book::ExportChapter {
             title: t.clone(),
-            content: c.clone(),
+            content: match &export_book_row {
+                Some(b) => {
+                    crate::api::book_asset::inline_asset_urls(&state, &namespace, b, c)
+                }
+                None => c.clone(),
+            },
         })
         .collect();
     // P2：GBK 不可映射字符转义计数（仅 txt/gbk 路径非 0）——随警告头返回
@@ -14262,17 +14270,22 @@ mod tests {
             ret.0.data["totalMemory"], "0M",
             "物理内存应真实读取（非 0M）"
         );
-        assert_ne!(
-            ret.0.data["freeMemory"], "0M",
-            "可用内存应真实读取（非 0M）"
+        // 注意：这里**不能**断言 freeMemory != "0M"。可用内存在机器吃紧时（例如与
+        // 编译并行跑测试）真的会舍入到 0MB，断言它非零会造成与代码无关的偶发失败。
+        // 这个用例要守的是「Windows 上全部读成 0」那个 bug——总内存非零 + 可用不超过总量
+        // 已足以覆盖，且不依赖运行环境的空闲程度。
+        assert!(
+            ret.0.data["freeMemory"].as_str().unwrap().ends_with('M'),
+            "可用内存应为 legacy 的 xxxM 字符串"
         );
         assert!(
             ret.0.data["memory"]["totalMb"].as_u64().unwrap() > 0,
             "memory.totalMb > 0"
         );
         assert!(
-            ret.0.data["memory"]["availableMb"].as_u64().unwrap() > 0,
-            "memory.availableMb > 0"
+            ret.0.data["memory"]["availableMb"].as_u64().unwrap()
+                <= ret.0.data["memory"]["totalMb"].as_u64().unwrap(),
+            "memory.availableMb 不应超过 totalMb（同上：不断言其非零，避免环境相关偶发）"
         );
         assert!(
             ret.0.data["memory"]["percent"].as_f64().unwrap() > 0.0,
