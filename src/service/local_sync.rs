@@ -437,21 +437,9 @@ async fn import_file(
         ..Default::default()
     };
     storage.save_local_book(ns, &info, &imported).await?;
-    // 封面落盘（与上传导入一致）
+    // 封面落盘（与上传导入一致：归一化为 JPEG + 尺寸上限）
     if let Some(cover) = &imported.cover {
-        let cover_dir = storage
-            .config
-            .storage_dir()
-            .join("assets")
-            .join(ns)
-            .join("covers");
-        let _ = std::fs::create_dir_all(&cover_dir);
-        let file_id = format!("{}.jpg", uuid::Uuid::new_v4());
-        if std::fs::write(cover_dir.join(&file_id), cover).is_ok() {
-            let _ = storage
-                .update_book_cover(ns, &book_url, &format!("/assets/{ns}/covers/{file_id}"))
-                .await;
-        }
+        save_book_cover(storage, ns, &book_url, cover).await;
     }
     // 文件关联（双轨）
     storage
@@ -535,23 +523,7 @@ async fn reparse_and_update(
     let _ = storage.patch_book(ns, &book.book_url, &patch).await;
     // 封面更新（新封面存在时替换）
     if let Some(cover) = &imported.cover {
-        let cover_dir = storage
-            .config
-            .storage_dir()
-            .join("assets")
-            .join(ns)
-            .join("covers");
-        let _ = std::fs::create_dir_all(&cover_dir);
-        let file_id = format!("{}.jpg", uuid::Uuid::new_v4());
-        if std::fs::write(cover_dir.join(&file_id), cover).is_ok() {
-            let _ = storage
-                .update_book_cover(
-                    ns,
-                    &book.book_url,
-                    &format!("/assets/{ns}/covers/{file_id}"),
-                )
-                .await;
-        }
+        save_book_cover(storage, ns, &book.book_url, cover).await;
     }
     // 更新关联（mtime/大小 + 清除删除标记）
     storage
@@ -768,6 +740,39 @@ async fn wait_until_settled(path: &Path, quiet_ms: i64) -> bool {
         last = Some((size, mtime));
         tokio::time::sleep(SETTLE_POLL).await;
     }
+}
+
+/// 封面落盘并更新书籍 cover_url（四处导入路径共用：上传 / 扫描目录 / 双轨自动导入 / 重扫）。
+///
+/// 归一化后再落盘（借鉴 booklore）：统一 JPEG、透明铺白底、上限 1000x1500。
+/// 此前四处都是 `write(uuid.jpg, 原始字节)`——PNG/WebP 封面被存成 .jpg 是**名实不符**
+/// （只靠浏览器嗅探才没出事），且 8000px 的扫描封面原样落盘，读书架时整份进内存。
+/// 归一化失败（非常见格式/解码不了）时保留原字节，不因为压不了就丢封面。
+pub async fn save_book_cover(storage: &Storage, ns: &str, book_url: &str, cover: &[u8]) -> bool {
+    if cover.is_empty() {
+        return false;
+    }
+    let cover_dir = storage
+        .config
+        .storage_dir()
+        .join("assets")
+        .join(ns)
+        .join("covers");
+    if std::fs::create_dir_all(&cover_dir).is_err() {
+        return false;
+    }
+    let (bytes, ext) = match crate::service::imaging::normalize_cover(cover) {
+        Some((jpg, _, _)) => (jpg, "jpg"),
+        None => (cover.to_vec(), local_book::image_ext_of(cover).unwrap_or("jpg")),
+    };
+    let file_id = format!("{}.{ext}", uuid::Uuid::new_v4());
+    if std::fs::write(cover_dir.join(&file_id), &bytes).is_err() {
+        return false;
+    }
+    storage
+        .update_book_cover(ns, book_url, &format!("/assets/{ns}/covers/{file_id}"))
+        .await
+        .is_ok()
 }
 
 /// 当前时间（毫秒）

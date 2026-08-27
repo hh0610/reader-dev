@@ -10464,26 +10464,13 @@ async fn scan_local_book_dir(
             }
         }
         if let Some(cover) = &imported_book.cover {
-            let cover_dir = state
-                .storage
-                .config
-                .storage_dir()
-                .join("assets")
-                .join(&namespace)
-                .join("covers");
-            let _ = std::fs::create_dir_all(&cover_dir);
-            let cover_id = format!("{}.jpg", uuid::Uuid::new_v4());
-            let cover_path = cover_dir.join(&cover_id);
-            if std::fs::write(&cover_path, cover).is_ok() {
-                let _ = state
-                    .storage
-                    .update_book_cover(
-                        &namespace,
-                        &book_url,
-                        &format!("/assets/{namespace}/covers/{cover_id}"),
-                    )
-                    .await;
-            }
+            crate::service::local_sync::save_book_cover(
+                &state.storage,
+                &namespace,
+                &book_url,
+                cover,
+            )
+            .await;
         }
         imported += 1;
         tracing::info!(
@@ -10668,25 +10655,8 @@ async fn upload_local_book(
     }
 
     if let Some(cover) = &imported.cover {
-        let cover_dir = state
-            .storage
-            .config
-            .storage_dir()
-            .join("assets")
-            .join(&namespace)
-            .join("covers");
-        let _ = std::fs::create_dir_all(&cover_dir);
-        let file_id = format!("{}.jpg", uuid::Uuid::new_v4());
-        if std::fs::write(cover_dir.join(&file_id), cover).is_ok() {
-            let _ = state
-                .storage
-                .update_book_cover(
-                    &namespace,
-                    &book_url,
-                    &format!("/assets/{namespace}/covers/{file_id}"),
-                )
-                .await;
-        }
+        crate::service::local_sync::save_book_cover(&state.storage, &namespace, &book_url, cover)
+            .await;
     }
 
     tracing::info!(

@@ -137,11 +137,17 @@ pub fn parse_epub(bytes: &[u8], toc_mode: &str) -> Result<ImportedBook> {
     let opf_str = String::from_utf8_lossy(&opf);
     let spin_chapters = opf_chapters(&mut zip, &opf_path, &opf_str);
 
-    // 5. 封面
-    let cover = meta.cover_href.as_ref().and_then(|href| {
-        let full = resolve_opf_path(&opf_path, href);
-        read_zip(&mut zip, &full).ok()
-    });
+    // 5. 封面：OPF 声明的四级回退在 parse_opf 里做完；这里补最后一级——
+    //    OPF 什么都没声明（野生中文 EPUB 常态）时裸扫 zip 找 *cover*.{jpg,png,webp,…}
+    let cover = meta
+        .cover_href
+        .as_ref()
+        .and_then(|href| {
+            let full = resolve_opf_path(&opf_path, href);
+            read_zip(&mut zip, &full).ok()
+        })
+        .filter(|b| !b.is_empty())
+        .or_else(|| scan_zip_for_cover(&mut zip));
 
     // 6. toc 目录解析（toc.ncx EPUB2 / nav.xhtml EPUB3）并按模式合并章节顺序/标题
     let toc_entries = parse_epub_toc(&mut zip, &opf_path, &opf_str);
@@ -153,6 +159,40 @@ pub fn parse_epub(bytes: &[u8], toc_mode: &str) -> Result<ImportedBook> {
         cover,
         format: "epub".into(),
     })
+}
+
+/// 封面回退最后一级（借鉴 booklore：它的第 5 级同样是裸扫 ZIP 条目名）。
+///
+/// OPF 里 guide / properties=cover-image / meta name=cover / id=cover 全都没有时，
+/// 扫压缩包里文件名含 "cover" 的图片。野生中文 EPUB 经常什么都不声明，
+/// 却老老实实放着一个 images/cover.jpg——不扫这一下就是「没有封面」。
+///
+/// 挑选规则是确定性的：文件名以 cover 打头优先，其次按路径字典序，
+/// 避免同一本书每次解析选到不同的图。
+fn scan_zip_for_cover<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Option<Vec<u8>> {
+    let mut hits: Vec<(u8, String, usize)> = Vec::new();
+    for i in 0..zip.len() {
+        let Ok(f) = zip.by_index_raw(i) else { continue };
+        if f.is_dir() {
+            continue;
+        }
+        let name = decode_zip_entry_name(f.name_raw(), f.name());
+        if is_junk_zip_entry(&name) || image_mime(&name).is_none() {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        let base = lower.rsplit('/').next().unwrap_or(&lower).to_string();
+        if base.starts_with("cover") {
+            hits.push((0, name, i));
+        } else if lower.contains("cover") {
+            hits.push((1, name, i));
+        }
+    }
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let idx = hits.first().map(|(_, _, i)| *i)?;
+    read_zip_index(zip, idx).ok().filter(|b| !b.is_empty())
 }
 
 /// 从 OPF manifest 定位 toc 文件并解析目录条目（对齐 legado EpubFile.getChapterList）：
@@ -2387,6 +2427,37 @@ pub(crate) fn image_mime(name: &str) -> Option<&'static str> {
     }
 }
 
+/// 按魔数判断图片扩展名（封面落盘用）。
+///
+/// 此前封面一律写成 `{uuid}.jpg`，PNG/WebP 封面**名实不符**，只靠浏览器嗅探才没出事；
+/// OPDS 客户端与部分下载器会按扩展名判类型，那边就会出错。
+pub(crate) fn image_ext_of(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("jpg");
+    }
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        return Some("png");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("gif");
+    }
+    if &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("bmp");
+    }
+    // SVG：文本格式，允许前置 BOM/空白与 XML 声明
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]);
+    if head.trim_start().starts_with("<svg") || head.contains("<svg") {
+        return Some("svg");
+    }
+    None
+}
+
 /// 文件名自然排序（数字段按数值比较：page2 < page10；其余按不区分大小写字符序）。
 /// 用于漫画页排序——纯字典序会把 10.jpg 排在 2.jpg 前面。
 pub(crate) fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
@@ -3470,6 +3541,71 @@ fn extract_title(html: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// OPF 完全不声明封面时，裸扫 zip 找 *cover* 图（booklore 第 5 级回退）
+    #[test]
+    fn epub封面裸扫兜底() {
+        use std::io::Write as _;
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        // OPF 里既无 guide、也无 properties/meta/id=cover —— 只有正文
+        let opf = r#"<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0">
+  <metadata><dc:title xmlns:dc="http://purl.org/dc/elements/1.1/">无封面声明</dc:title></metadata>
+  <manifest>
+    <item id="c1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine><itemref idref="c1"/></spine>
+</package>"#;
+        let container = r#"<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles><rootfile full-path="content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#;
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::FileOptions::default();
+            zip.start_file("META-INF/container.xml", opts).unwrap();
+            zip.write_all(container.as_bytes()).unwrap();
+            zip.start_file("content.opf", opts).unwrap();
+            zip.write_all(opf.as_bytes()).unwrap();
+            zip.start_file("ch1.xhtml", opts).unwrap();
+            zip.write_all("<html><body><p>正文</p></body></html>".as_bytes()).unwrap();
+            // 干扰项：另一张图，名字不含 cover，不应被选中
+            zip.start_file("images/illust01.png", opts).unwrap();
+            zip.write_all(png).unwrap();
+            // 真封面：只有文件名能看出来
+            zip.start_file("images/cover.png", opts).unwrap();
+            zip.write_all(png).unwrap();
+            zip.finish().unwrap();
+        }
+        let book = parse_epub(&buf.into_inner(), DEFAULT_EPUB_TOC_MODE).expect("应能解析");
+        assert!(
+            book.cover.is_some(),
+            "OPF 无任何封面声明时应裸扫 zip 兜底，否则这本书就是「没有封面」"
+        );
+        assert_eq!(book.cover.as_deref(), Some(png), "应选中 images/cover.png");
+    }
+
+    #[test]
+    fn 按魔数判图片扩展名() {
+        let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 13];
+        assert_eq!(image_ext_of(png), Some("png"));
+        let jpg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0, 16, b'J', b'F', b'I', b'F', 0, 1];
+        assert_eq!(image_ext_of(jpg), Some("jpg"));
+        let mut webp = b"RIFF\x00\x00\x00\x00WEBP".to_vec();
+        webp[4..8].copy_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(image_ext_of(&webp), Some("webp"));
+        assert_eq!(image_ext_of(b"GIF89a-----="), Some("gif"));
+        assert_eq!(image_ext_of(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"), Some("svg"));
+        assert_eq!(image_ext_of(b"plain text not image"), None);
+        assert_eq!(image_ext_of(b"tiny"), None, "过短不得越界 panic");
+    }
+
     /// GBK 条目名的 CBZ（Windows 压缩包常态：未置 UTF-8 标志位、名字是 GBK）
     #[test]
     fn cbz_gbk条目名不再乱码() {

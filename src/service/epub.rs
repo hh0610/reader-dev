@@ -225,11 +225,36 @@ pub fn parse_opf(xml: &str) -> OpfMeta {
     // 否则 Calibre EPUB2 的 guide（常指向 titlepage.xhtml 包装页）会赢过 meta name=cover
     // 指向的真图 → 读出 HTML 当封面字节 → 裂图（新增的 meta 封面特性也就形同虚设）。
     let meta_cover_href = cover_meta_id.and_then(|id| manifest.get(&id).cloned());
+    // 第 5 级（借鉴 booklore EpubMetadataExtractor 的启发式）：manifest 里 **id 或 href 含
+    // "cover"** 的图片条目。上面几级都要求 OPF 明确声明；野生中文 EPUB 常常什么都不声明，
+    // 却老老实实放着一个 images/cover.jpg。
+    // 注意：manifest 是 HashMap，直接 find 会因迭代顺序不定而每次选到不同的图。
+    // 这里显式排序——文件名以 cover 打头的优先，其次按 href 字典序，保证同一本书结果稳定。
+    let cover_guessed = {
+        let mut hits: Vec<(u8, &String)> = manifest
+            .iter()
+            .filter(|(_, href)| image_hrefs.contains(*href))
+            .filter_map(|(id, href)| {
+                let hl = href.to_ascii_lowercase();
+                let base = hl.rsplit('/').next().unwrap_or(&hl).to_string();
+                if base.starts_with("cover") {
+                    Some((0u8, href))
+                } else if hl.contains("cover") || id.to_ascii_lowercase().contains("cover") {
+                    Some((1u8, href))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        hits.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        hits.first().map(|(_, h)| (*h).clone())
+    };
     let candidates = [
         cover_guide,
         cover_properties,
         meta_cover_href,
         cover_id_item,
+        cover_guessed,
     ];
     // 无 manifest media-type 信息时（image_hrefs 为空）不做过滤，保持原回退顺序
     meta.cover_href = candidates

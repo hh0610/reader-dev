@@ -57,8 +57,135 @@ pub fn to_webp(bytes: &[u8], quality: u8) -> Option<Vec<u8>> {
     Some(out.into_inner())
 }
 
-#[cfg(test)]
+/// 封面归一化上限（借鉴 booklore FileService：原图 1000x1500 防 OOM）
+pub const COVER_MAX_W: u32 = 1000;
+pub const COVER_MAX_H: u32 = 1500;
+/// 缩略图目标尺寸（booklore 取 250x350；方形源图——有声书封面——改用 250x250）
+pub const THUMB_W: u32 = 250;
+pub const THUMB_H: u32 = 350;
+/// 判定为「方形」的宽高比区间（booklore 用 0.85~1.15）
+const SQUARE_RATIO_LO: f32 = 0.85;
+const SQUARE_RATIO_HI: f32 = 1.15;
+
+/// 封面归一化（借鉴 booklore 的 FileService.saveCoverImage）：
+/// - 统一转 **JPEG**：格式收敛，前端与 OPDS 不用再猜类型
+/// - 透明通道用**白底铺平**：PNG 透明封面在深色底上会露出诡异的边
+/// - 超过 1000x1500 等比缩小：注释里 booklore 直说是 "prevent OOM"，
+///   我们此前把原图整份 base64 塞进 DB/响应，一张 8000px 扫描封面就是几十 MB
+///
+/// 返回 (jpeg 字节, 宽, 高)；解码失败返回 None，调用方保持原字节即可。
+pub fn normalize_cover(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    encode_fitted(bytes, COVER_MAX_W, COVER_MAX_H)
+}
+
+/// 生成缩略图（列表页用；方形源图按 250x250，其余 250x350）
+pub fn make_thumbnail(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let (w, h) = check_image_dimensions(bytes).ok()?;
+    let ratio = if h == 0 { 1.0 } else { w as f32 / h as f32 };
+    let (tw, th) = if (SQUARE_RATIO_LO..=SQUARE_RATIO_HI).contains(&ratio) {
+        (THUMB_W, THUMB_W)
+    } else {
+        (THUMB_W, THUMB_H)
+    };
+    encode_fitted(bytes, tw, th)
+}
+
+/// 等比缩放到不超过 (max_w, max_h) 并编码为 JPEG（透明铺白底）。
+/// 源图本就更小时不放大——放大只会变糊且徒增体积。
+fn encode_fitted(bytes: &[u8], max_w: u32, max_h: u32) -> Option<(Vec<u8>, u32, u32)> {
+    check_image_dimensions(bytes).ok()?;
+    let fmt = image::guess_format(bytes).ok()?;
+    let img = image::load_from_memory_with_format(bytes, fmt).ok()?;
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let img = if w > max_w || h > max_h {
+        img.resize(max_w, max_h, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+    // 透明铺白底：先转 RGBA 再逐像素按 alpha 混到白，最后落 RGB8（JPEG 无 alpha 通道，
+    // 直接 to_rgb8 会把透明区域当黑色，深色封面上会出现整块黑边）
+    let rgba = img.to_rgba8();
+    let (ow, oh) = (rgba.width(), rgba.height());
+    let mut rgb = image::RgbImage::new(ow, oh);
+    for (x, y, px) in rgba.enumerate_pixels() {
+        let a = px[3] as u32;
+        let blend = |c: u8| -> u8 { ((c as u32 * a + 255 * (255 - a)) / 255) as u8 };
+        rgb.put_pixel(x, y, image::Rgb([blend(px[0]), blend(px[1]), blend(px[2])]));
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85);
+    image::DynamicImage::ImageRgb8(rgb)
+        .write_with_encoder(encoder)
+        .ok()?;
+    Some((out.into_inner(), ow, oh))
+}
+
+#[cfg(test)]#[cfg(test)]
 mod tests {
+    /// 造一张带透明区域的 PNG
+    fn transparent_png(w: u32, h: u32) -> Vec<u8> {
+        let mut img = image::RgbaImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            // 左半透明、右半不透明红色
+            *px = if x < w / 2 {
+                image::Rgba([0, 0, 0, 0])
+            } else {
+                image::Rgba([255, 0, 0, 255])
+            };
+            let _ = y;
+        }
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn 封面归一化_转jpeg并铺白底() {
+        let png = transparent_png(40, 60);
+        let (jpg, w, h) = normalize_cover(&png).expect("应能归一化");
+        assert_eq!((w, h), (40, 60), "小于上限时不放大");
+        assert!(jpg.starts_with(&[0xFF, 0xD8, 0xFF]), "输出必须是 JPEG");
+        // 透明区域应被铺成白色，而不是 to_rgb8 的黑色
+        let decoded = image::load_from_memory(&jpg).unwrap().to_rgb8();
+        let px = decoded.get_pixel(2, 2);
+        assert!(
+            px[0] > 230 && px[1] > 230 && px[2] > 230,
+            "透明区域应铺白底，实际 {px:?}（直接 to_rgb8 会得到黑色）"
+        );
+    }
+
+    #[test]
+    fn 封面归一化_超大图等比缩到上限内() {
+        let big = transparent_png(2400, 1200);
+        let (_, w, h) = normalize_cover(&big).expect("应能归一化");
+        assert!(w <= COVER_MAX_W && h <= COVER_MAX_H, "实际 {w}x{h}");
+        // 等比：2400x1200 是 2:1，缩到宽 1000 → 高 500
+        assert_eq!((w, h), (1000, 500), "必须等比，拉伸会让封面变形");
+    }
+
+    #[test]
+    fn 缩略图_方形源图用正方形尺寸() {
+        // 竖版封面 → 250x350 盒内
+        let tall = transparent_png(600, 900);
+        let (_, w, h) = make_thumbnail(&tall).unwrap();
+        assert!(w <= THUMB_W && h <= THUMB_H, "{w}x{h}");
+        // 方形（有声书封面）→ 250x250 盒内，不被压成 250x350 的细长比例
+        let square = transparent_png(600, 600);
+        let (_, w, h) = make_thumbnail(&square).unwrap();
+        assert_eq!((w, h), (250, 250));
+    }
+
+    #[test]
+    fn 归一化_非图片返回none由调用方保留原字节() {
+        assert!(normalize_cover(b"not an image at all").is_none());
+        assert!(make_thumbnail(&[]).is_none());
+    }
+
     use super::*;
 
     /// 生成 4x4 PNG 测试图 → webp 转码：RIFF/WEBP 头 + 可解码回原尺寸
