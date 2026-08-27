@@ -2451,34 +2451,32 @@ fn parse_cbz_impl(bytes: &[u8], total_max: u64) -> Result<ImportedBook> {
     let mut zip =
         zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("CBZ 不是有效的 zip")?;
     let mut pages: Vec<(String, usize)> = Vec::new();
-    let mut comic_info_name: Option<String> = None;
-    let mut first_image: Option<String> = None;
+    let mut comic_info_idx: Option<usize> = None;
+    let mut first_image_idx: Option<usize> = None;
     for i in 0..zip.len() {
         let Ok(f) = zip.by_index(i) else { continue };
         if f.is_dir() {
             continue;
         }
-        let name = f.name().to_string();
+        // 条目名按原始字节重新判定编码：中文压缩包多为 GBK 且未置 UTF-8 标志位，
+        // 沿用 zip crate 的 CP437 结果会让章节标题全是乱码
+        let name = decode_zip_entry_name(f.name_raw(), f.name());
         // ComicInfo.xml 可位于任意目录（legacy 仅根目录；放宽为不丢失元数据）
         if std::path::Path::new(&name)
             .file_name()
             .map(|s| s.eq_ignore_ascii_case("ComicInfo.xml"))
             .unwrap_or(false)
         {
-            comic_info_name = Some(name.clone());
+            comic_info_idx = Some(i);
         }
-        let base = std::path::Path::new(&name)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| name.clone());
-        // 跳过隐藏文件（.DS_Store 等）；非图片扩展名不参与分页
-        if base.starts_with('.') {
+        // 跳过隐藏文件与 __MACOSX 资源叉（后者与真页图同名，混入会让页数翻倍）
+        if is_junk_zip_entry(&name) {
             continue;
         }
         if image_mime(&name).is_some() {
             // legacy 取 zip 条目顺序的首张图片作封面（非自然序）
-            if first_image.is_none() {
-                first_image = Some(name.clone());
+            if first_image_idx.is_none() {
+                first_image_idx = Some(i);
             }
             pages.push((name, i));
         }
@@ -2490,8 +2488,8 @@ fn parse_cbz_impl(bytes: &[u8], total_max: u64) -> Result<ImportedBook> {
     pages.sort_by(|x, y| natural_cmp(&x.0, &y.0));
     // ComicInfo.xml 元数据（Title/Writer）
     let mut meta = OpfMeta::default();
-    if let Some(info_name) = comic_info_name {
-        if let Ok(xml) = read_zip(&mut zip, &info_name) {
+    if let Some(info_idx) = comic_info_idx {
+        if let Ok(xml) = read_zip_index(&mut zip, info_idx) {
             let xml = String::from_utf8_lossy(&xml);
             meta.title = crate::service::epub::extract_tag(&xml, "Title")
                 .map(|s| crate::service::epub::decode_entities(&s))
@@ -2502,16 +2500,16 @@ fn parse_cbz_impl(bytes: &[u8], total_max: u64) -> Result<ImportedBook> {
         }
     }
     // 封面：zip 条目顺序首张图片（legacy updateCover 行为；读取失败忽略）
-    let cover = first_image
-        .as_deref()
-        .and_then(|n| read_zip(&mut zip, n).ok())
+    let cover = first_image_idx
+        .and_then(|i| read_zip_index(&mut zip, i).ok())
         .filter(|b| !b.is_empty());
     use base64::Engine;
     let mut chapters = Vec::with_capacity(pages.len());
     // P1-C3：全部条目累计输出上限（解压炸弹防护——条目多/单条目大均受限）
     let mut total = 0u64;
-    for (name, _idx) in pages {
-        let bytes = read_zip(&mut zip, &name).context("读取 CBZ 图片失败")?;
+    for (name, idx) in pages {
+        // 按索引读：解码后的名字与 zip crate 内部名可能不同，by_name 会查不到
+        let bytes = read_zip_index(&mut zip, idx).context("读取 CBZ 图片失败")?;
         total = total.saturating_add(bytes.len() as u64);
         if total > total_max {
             anyhow::bail!(
@@ -2540,6 +2538,48 @@ fn parse_cbz_impl(bytes: &[u8], total_max: u64) -> Result<ImportedBook> {
     })
 }
 
+/// ZIP 条目名解码（借鉴 booklore 的 ENCODINGS_TO_TRY，链首换成中文场景该有的 GB18030）。
+///
+/// 背景：zip 规范只有「UTF-8 标志位」这一个信号。未置位的条目，zip crate 一律按 **CP437** 解码——
+/// 这是 DOS 代码页，能把任意字节映射成可打印字符，所以**不会报错，只会静默变乱码**。
+/// Windows 上用资源管理器/Bandizip 打的中文压缩包基本都不置位、名字是 GBK，
+/// 于是章节标题会显示成「娴嬭瘯」这类内容。
+///
+/// 判定顺序：UTF-8 →（无错解码）GB18030 → Shift_JIS → Big5 → 保底沿用 CP437 结果。
+/// 注意这是启发式：日文 Shift_JIS 名若恰好也能被 GB18030 无错解码，会被判成中文乱码。
+/// 面向中文用户取这个顺序是划算的，且**不影响分页顺序**——序号是 ASCII 数字，
+/// 在以上所有编码里字节一致，自然序排序不受解码结果影响。
+pub(crate) fn decode_zip_entry_name(raw: &[u8], cp437_decoded: &str) -> String {
+    if let Ok(s) = std::str::from_utf8(raw) {
+        return s.to_string();
+    }
+    for enc in [
+        encoding_rs::GB18030,
+        encoding_rs::SHIFT_JIS,
+        encoding_rs::BIG5,
+    ] {
+        let (cow, _, had_errors) = enc.decode(raw);
+        if !had_errors {
+            return cow.into_owned();
+        }
+    }
+    cp437_decoded.to_string()
+}
+
+/// 压缩包内应忽略的条目（macOS 资源叉 / 系统缩略图数据库等）。
+/// `__MACOSX/` 下是 AppleDouble 副本，条目名与真页图同名，混进来会让页数翻倍。
+pub(crate) fn is_junk_zip_entry(name: &str) -> bool {
+    let norm = name.replace('\\', "/");
+    if norm.starts_with("__MACOSX/") || norm.contains("/__MACOSX/") {
+        return true;
+    }
+    let base = norm.rsplit('/').next().unwrap_or(&norm);
+    base.starts_with("._")
+        || base.starts_with('.')
+        || base.eq_ignore_ascii_case("Thumbs.db")
+        || base.eq_ignore_ascii_case("desktop.ini")
+}
+
 /// zip 条目相对路径安全性（zip-slip 防护）：拒绝绝对路径、盘符、含 `..` 分量的条目名
 fn is_safe_zip_entry_path(name: &str) -> bool {
     if name.is_empty() || name.starts_with('/') || name.starts_with('\\') {
@@ -2558,33 +2598,30 @@ fn is_safe_zip_entry_path(name: &str) -> bool {
 pub fn extract_cbz_chapter_images(bytes: &[u8], out_dir: &std::path::Path) -> Result<Vec<String>> {
     let mut zip =
         zip::ZipArchive::new(std::io::Cursor::new(bytes)).context("CBZ 不是有效的 zip")?;
-    let mut names: Vec<String> = Vec::new();
+    let mut names: Vec<(String, usize)> = Vec::new();
     for i in 0..zip.len() {
         let Ok(f) = zip.by_index(i) else { continue };
         if f.is_dir() {
             continue;
         }
-        let name = f.name().to_string();
+        // 与 parse_cbz 同一套编码回退：否则解压出来的文件名是乱码
+        let name = decode_zip_entry_name(f.name_raw(), f.name());
         if !is_safe_zip_entry_path(&name) {
             continue;
         }
-        let base = std::path::Path::new(&name.replace('\\', "/"))
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        // 隐藏文件（.DS_Store 等）；非图片扩展名不作为页图
-        if base.starts_with('.') || image_mime(&name).is_none() {
+        // 隐藏文件 / __MACOSX 资源叉；非图片扩展名不作为页图
+        if is_junk_zip_entry(&name) || image_mime(&name).is_none() {
             continue;
         }
-        names.push(name);
+        names.push((name, i));
     }
     anyhow::ensure!(!names.is_empty(), "CBZ 内未找到图片");
-    names.sort_by(|a, b| natural_cmp(a, b));
+    names.sort_by(|a, b| natural_cmp(&a.0, &b.0));
     std::fs::create_dir_all(out_dir)?;
     let mut out = Vec::with_capacity(names.len());
     let mut total = 0u64;
-    for name in &names {
-        let data = read_zip_limited(&mut zip, name, MAX_ZIP_ENTRY_BYTES)?;
+    for (name, idx) in &names {
+        let data = read_zip_index(&mut zip, *idx)?;
         total = total.saturating_add(data.len() as u64);
         anyhow::ensure!(
             total <= MAX_CBZ_TOTAL_BYTES,
@@ -3073,12 +3110,60 @@ fn read_zip<R: std::io::Read + std::io::Seek>(
     read_zip_limited(zip, path, MAX_ZIP_ENTRY_BYTES)
 }
 
+/// 按「编码回退后的条目名」反查索引（精确匹配优先，其次大小写不敏感）。
+/// 返回 None 表示压缩包里确实没有这个条目。
+fn zip_index_by_decoded_name<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    path: &str,
+) -> Option<usize> {
+    let want = path.replace('\\', "/");
+    let mut ci_hit: Option<usize> = None;
+    for i in 0..zip.len() {
+        let Ok(f) = zip.by_index_raw(i) else { continue };
+        let decoded = decode_zip_entry_name(f.name_raw(), f.name()).replace('\\', "/");
+        if decoded == want {
+            return Some(i);
+        }
+        if ci_hit.is_none() && decoded.eq_ignore_ascii_case(&want) {
+            ci_hit = Some(i);
+        }
+    }
+    ci_hit
+}
+
+/// 按索引读取 zip 条目（条目名经编码回退解码后与 zip crate 内部名可能不一致，
+/// 此时 by_name 查不到，只能按索引取）
+fn read_zip_index<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+    index: usize,
+) -> Result<Vec<u8>> {
+    let mut f = zip.by_index(index)?;
+    let mut buf = Vec::new();
+    std::io::Read::take(&mut f, MAX_ZIP_ENTRY_BYTES + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_ZIP_ENTRY_BYTES {
+        anyhow::bail!(
+            "条目 [{}] 解压后超出大小上限（{}MB），已拒绝",
+            index,
+            MAX_ZIP_ENTRY_BYTES / 1024 / 1024
+        );
+    }
+    Ok(buf)
+}
+
 /// 带输出上限的 zip 条目读取（P1-C3；测试用小上限验证超限路径）
 fn read_zip_limited<R: std::io::Read + std::io::Seek>(
     zip: &mut zip::ZipArchive<R>,
     path: &str,
     max_bytes: u64,
 ) -> Result<Vec<u8>> {
+    // by_name 用的是 zip crate 的解码名。OPF/NCX 里的 href 是 UTF-8，而条目名未置
+    // UTF-8 标志位时被按 CP437 解成乱码 —— 两者对不上，整本 EPUB 就读不出内容。
+    // 精确名查不到时，按编码回退后的名字再找一次（再不行按大小写不敏感找）。
+    if zip.by_name(path).is_err() {
+        if let Some(idx) = zip_index_by_decoded_name(zip, path) {
+            return read_zip_index(zip, idx);
+        }
+    }
     let mut f = zip.by_name(path)?;
     let mut buf = Vec::new();
     std::io::Read::take(&mut f, max_bytes + 1).read_to_end(&mut buf)?;
@@ -3385,6 +3470,118 @@ fn extract_title(html: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// GBK 条目名的 CBZ（Windows 压缩包常态：未置 UTF-8 标志位、名字是 GBK）
+    #[test]
+    fn cbz_gbk条目名不再乱码() {
+        use std::io::Write as _;
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        // zip crate 写入时总会置 UTF-8 标志位，无法直接造出「GBK 名 + 无标志位」的包，
+        // 故先正常写入 ASCII 占位名，再在字节流里把名字替换成 GBK 字节并清掉标志位。
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            let opts = zip::write::FileOptions::default();
+            // 占位名长度必须与 GBK 字节数相同（「第01话.png」→ 6 汉字节 + 6 ASCII = 12 字节）
+            zip.start_file("AAAAAA01.png", opts).unwrap();
+            zip.write_all(png).unwrap();
+            zip.finish().unwrap();
+        }
+        let mut raw = buf.into_inner();
+        // 「第01话.png」的 GBK 字节：第=B5DA 话=BBB0
+        let gbk_name: Vec<u8> = vec![
+            0xB5, 0xDA, b'0', b'1', 0xBB, 0xB0, b'.', b'p', b'n', b'g',
+        ];
+        let placeholder = b"AAAAAA01.png";
+        assert_eq!(placeholder.len(), 12);
+        // 占位名 12 字节，GBK 名 10 字节——长度不同会破坏 zip 结构，故补两个 ASCII 前缀
+        let gbk_name: Vec<u8> = {
+            let mut v = vec![b'p', b'_'];
+            v.extend_from_slice(&gbk_name);
+            v
+        };
+        assert_eq!(gbk_name.len(), placeholder.len());
+        let mut replaced = 0;
+        let mut i = 0;
+        while i + placeholder.len() <= raw.len() {
+            if &raw[i..i + placeholder.len()] == placeholder {
+                raw[i..i + placeholder.len()].copy_from_slice(&gbk_name);
+                replaced += 1;
+                i += placeholder.len();
+            } else {
+                i += 1;
+            }
+        }
+        assert!(replaced >= 2, "本地头与中央目录都应被替换，实际 {replaced}");
+        // 清掉 UTF-8 标志位（general purpose flag 的 bit 11），模拟 Windows 压缩包
+        clear_utf8_flag(&mut raw);
+
+        // 先证明这个用例不是空跑的：zip crate 自己给出的名字确实是 CP437 乱码
+        {
+            let mut z = zip::ZipArchive::new(std::io::Cursor::new(raw.clone())).unwrap();
+            let f = z.by_index(0).unwrap();
+            assert_ne!(
+                f.name(),
+                "p_第01话.png",
+                "标志位未清干净，用例失去意义（zip crate 已按 UTF-8 解出正确名字）"
+            );
+        }
+
+        let book = parse_cbz(&raw).expect("GBK 名 CBZ 应能解析");
+        assert_eq!(book.chapters.len(), 1);
+        assert_eq!(
+            book.chapters[0].title, "p_第01话.png",
+            "条目名应按 GBK 解码；沿用 zip crate 的 CP437 结果会是乱码"
+        );
+    }
+
+    /// 把 zip 字节流里所有 general purpose flag 的 UTF-8 位（bit 11）清零
+    #[cfg(test)]
+    fn clear_utf8_flag(raw: &mut [u8]) {
+        // 本地文件头 PK\x03\x04：flag 在偏移 +6；中央目录头 PK\x01\x02：flag 在偏移 +8
+        let mut i = 0;
+        while i + 10 < raw.len() {
+            if raw[i..i + 4] == [0x50, 0x4B, 0x03, 0x04] {
+                raw[i + 7] &= !0x08;
+            } else if raw[i..i + 4] == [0x50, 0x4B, 0x01, 0x02] {
+                raw[i + 9] &= !0x08;
+            }
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn 条目名编码回退各分支() {
+        // UTF-8 优先
+        assert_eq!(decode_zip_entry_name("第1话.png".as_bytes(), "垃圾"), "第1话.png");
+        // 纯 ASCII 原样
+        assert_eq!(decode_zip_entry_name(b"page01.jpg", "page01.jpg"), "page01.jpg");
+        // GBK
+        let gbk = [0xB5u8, 0xDA, 0xD2, 0xBB];  // 「第一」
+        assert_eq!(decode_zip_entry_name(&gbk, "乱码"), "第一");
+        // 全都解不出 → 保底沿用 zip crate 的 CP437 结果
+        let bad = [0xFFu8, 0xFE, 0xFD, 0xFC];
+        let out = decode_zip_entry_name(&bad, "CP437结果");
+        assert!(!out.is_empty(), "保底不得返回空名");
+    }
+
+    #[test]
+    fn 垃圾条目识别() {
+        assert!(is_junk_zip_entry("__MACOSX/comic/._001.jpg"));
+        assert!(is_junk_zip_entry("comic/__MACOSX/001.jpg"));
+        assert!(is_junk_zip_entry("comic/._001.jpg"));
+        assert!(is_junk_zip_entry("comic/.DS_Store"));
+        assert!(is_junk_zip_entry("comic/Thumbs.db"));
+        assert!(is_junk_zip_entry("comic/desktop.ini"));
+        assert!(!is_junk_zip_entry("comic/001.jpg"));
+        assert!(!is_junk_zip_entry("第01话/001.jpg"));
+    }
+
     use super::*;
 
     #[test]
