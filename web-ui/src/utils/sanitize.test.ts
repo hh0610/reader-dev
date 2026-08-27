@@ -125,3 +125,14 @@ test('净化器绕过封堵：`/` 作属性分隔符 + 未闭合 style/script', 
   // 正常内容不受影响
   assert.equal(sanitizeHtml('<p>正常文本</p>'), '<p>正常文本</p>')
 })
+
+test('CSS 多栏下 page-break-* 无效：改写为 -webkit-column-break-*（分页阅读模式才会断页）', () => {
+  const out = sanitizeHtml('<div style="page-break-after: always">章末</div>')
+  assert.ok(out.includes('-webkit-column-break-after:'), out)
+  assert.ok(!/[^-]page-break-after/.test(out), '不应残留原属性名: ' + out)
+  // before / inside 同样改写，大小写与空格不敏感
+  assert.ok(sanitizeHtml('<p style="PAGE-BREAK-BEFORE :always">').includes('-webkit-column-break-before:'))
+  assert.ok(sanitizeHtml('<p style="page-break-inside:avoid">').includes('-webkit-column-break-inside:'))
+  // 不误伤其它内容
+  assert.equal(sanitizeHtml('<p>关于 page-break 的说明</p>'), '<p>关于 page-break 的说明</p>')
+})

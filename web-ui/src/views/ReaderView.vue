@@ -6119,6 +6119,15 @@ onBeforeUnmount(() => {
 .reader-content {
   color: var(--text-1);
 }
+/* 白底插图在护眼底色上是一块刺眼白斑（EPUB 插图几乎都是白底 JPEG/PNG）。
+   multiply 让白色区域取底色、深色线稿保持不变，图就"融"进纸色里。
+   仅用于暖色/纸质主题：深色主题下 multiply 会把整张图压黑，那里保持原样。
+   （booklore 的 style.service.ts 用的就是这一招） */
+.reader-page[data-reader-theme='warm'] .reader-content :deep(img),
+.reader-page[data-reader-theme='warm'] .reader-content :deep(svg) {
+  background-color: transparent !important;
+  mix-blend-mode: multiply;
+}
 .reader-para {
   margin: 0 0 1em;
   text-indent: 2em;

@@ -94,5 +94,13 @@ export function sanitizeHtml(html: string): string {
           return isDangerousUrl(decodeEntities(unquoted)) ? '' : m
         },
       )
+      // CSS 多栏布局下 page-break-* 完全无效（分页阅读模式正文用的就是多栏），
+      // 浏览器只认 -webkit-column-break-*。EPUB 里作者写的分页控制若不改写，
+      // 在「仿真翻页」模式下会静默失效——章节该断页的地方不断。
+      // （foliate-js 的 paginator.js 做的是同一件事）
+      .replace(
+        /page-break-(after|before|inside)\s*:/gi,
+        (_m, kind: string) => `-webkit-column-break-${kind.toLowerCase()}:`,
+      )
   )
 }
