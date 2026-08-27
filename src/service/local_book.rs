@@ -3292,7 +3292,28 @@ where
                 }
                 continue;
             }
-            if matches!(name, "p" | "div" | "h1" | "h2" | "h3" | "br" | "li") {
+            if matches!(
+                name,
+                "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "br" | "li"
+                    | "blockquote" | "section" | "article"
+            ) {
+                // 仅在「叶子块」上取文本：块级容器若还含块级子元素，交给子元素分别成段。
+                // 否则外层 div 会把整章文字收成一大坨，正文既糊成一段又与各 <p> 重复一遍
+                // （实测：某轻小说章节第 0 行 10496 字全糊在一起，其后才是正常分段）。
+                let has_block_child = el.descendants().any(|d| {
+                    d != el
+                        && matches!(
+                            d.value(),
+                            Node::Element(c) if matches!(
+                                c.name(),
+                                "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                                    | "li" | "blockquote" | "section" | "article"
+                            )
+                        )
+                });
+                if has_block_child {
+                    continue;
+                }
                 let text = el
                     .descendants()
                     .filter_map(|d| match d.value() {
@@ -5195,4 +5216,44 @@ mod tests {
         assert!(out.contains("文字"));
     }
 
+
+    /// 生产实测回归：EPUB 标准结构 body>div>(h3,p,p...) 时，外层 div 不得把整章
+    /// 收成一大段——此前实测某轻小说章节首行 10496 字全糊在一起，且与各 <p> 重复一遍。
+    #[test]
+    fn test_html_to_text_leaf_block_only() {
+        let html = r#"<html><body><div>
+            <h3>第二章</h3>
+            <h4>副标题</h4>
+            <p>「…………」</p>
+            <p>「怎……怎么样？」</p>
+            <p>那个……我是觉得。</p>
+          </div></body></html>"#;
+        let out = html_to_text(html);
+        let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 5, "应为 5 个独立段落: {lines:?}");
+        assert_eq!(lines[0], "第二章");
+        assert_eq!(lines[1], "副标题");
+        assert_eq!(lines[2], "「…………」");
+        // 关键：不得出现把整章连在一起的巨段
+        assert!(
+            !lines.iter().any(|l| l.contains("第二章") && l.contains("怎么样")),
+            "外层容器不应重复收集全章文本: {lines:?}"
+        );
+    }
+
+    /// 嵌套容器（div>div>p）同样只在叶子块取文本
+    #[test]
+    fn test_html_to_text_nested_containers() {
+        let html = r#"<body><div><div><section><p>甲</p><p>乙</p></section></div></div></body>"#;
+        let out = html_to_text(html);
+        let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines, vec!["甲", "乙"], "{lines:?}");
+    }
+
+    /// 叶子块内的行内标签（b/span/em）文本仍应合并进同一段
+    #[test]
+    fn test_html_to_text_inline_tags_kept_in_paragraph() {
+        let html = r#"<body><div><p>前<b>粗体</b>中<span>行内</span>后</p></div></body>"#;
+        assert_eq!(html_to_text(html), "前粗体中行内后");
+    }
 }

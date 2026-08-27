@@ -172,7 +172,8 @@ function buildShelfBook(): Book {
   const i = info.value
   return {
     bookUrl: i?.bookUrl || bookUrl.value,
-    tocUrl: i?.tocUrl || '',
+    // tocUrl 以 bookUrl 兜底：落空会导致打开该书时后端报「请输入书籍链接」
+    tocUrl: i?.tocUrl || i?.bookUrl || bookUrl.value,
     origin: i?.origin || queryOrigin.value,
     originName: i?.originName || queryOriginName.value,
     name: i?.name || '',
@@ -384,7 +385,7 @@ async function openToc() {
   tocLoading.value = true
   tocError.value = false
   try {
-    const res = await getBookToc(p.tocUrl, p.origin)
+    const res = await getBookToc(p.tocUrl, p.origin, undefined, bookUrl.value)
     tocChapters.value = res.data ?? []
     tocLoaded.value = true
     if (tocChapters.value.length === 0) tocError.value = true
@@ -641,29 +642,39 @@ async function runSourceSearch() {
   }
 }
 
-/** 点击结果 → 切换书源：saveBook 更新 origin/originName/tocUrl（bookUrl 保持书架主键不变） */
+/**
+ * 点击结果 → 切换书源。
+ *
+ * 注意：候选源搜索结果的 tocUrl **恒为空**（搜索规则一般不返回），
+ * 直接落库会把书写成「tocUrl 空」，之后每次打开都报「请输入书籍链接」；
+ * 只换 origin 而保留旧 bookUrl 亦会让书变成「新源规则 + 旧源地址」。
+ * 因此：tocUrl 以 bookUrl 兜底，bookUrl 一并切到候选源。
+ */
 async function switchSource(r: SearchBook) {
   const b = shelfBook.value
   if (!b || sourceSwitching.value) return
   if (!r.origin || r.origin === currentOrigin.value) return
   sourceSwitching.value = true
   try {
+    const nextBookUrl = r.bookUrl || b.bookUrl
+    const nextTocUrl = r.tocUrl || nextBookUrl
     await saveBook({
-      bookUrl: b.bookUrl,
+      bookUrl: nextBookUrl,
       origin: r.origin,
       originName: r.originName,
-      tocUrl: r.tocUrl,
+      tocUrl: nextTocUrl,
     } as Book)
     // 本地同步书架条目 + 用新源刷新详情
     b.origin = r.origin
     b.originName = r.originName
-    b.tocUrl = r.tocUrl
+    b.tocUrl = nextTocUrl
+    b.bookUrl = nextBookUrl
     currentOrigin.value = r.origin
     info.value = null
     tocLoaded.value = false
     tocChapters.value = []
     try {
-      const infoRes = await getBookInfo(bookUrl.value, r.origin)
+      const infoRes = await getBookInfo(r.bookUrl || bookUrl.value, r.origin)
       if (infoRes.isSuccess) info.value = infoRes.data
     } catch {
       // 详情刷新失败：书架数据兜底展示
@@ -692,7 +703,13 @@ async function relocateProgressAfterSwitch(r: SearchBook) {
   const oldIdx = typeof b.durChapterIndex === 'number' ? b.durChapterIndex : -1
   if (oldIdx < 0) return // 无进度不处理
   try {
-    const tocRes = await getBookToc(r.tocUrl || b.tocUrl, r.origin)
+    // 同上：候选源 tocUrl 常为空 → 用其 bookUrl 兜底并附 url 参数
+    const tocRes = await getBookToc(
+      r.tocUrl || r.bookUrl || b.tocUrl,
+      r.origin,
+      { silent: true },
+      r.bookUrl || b.bookUrl,
+    )
     const toc = tocRes.isSuccess ? (tocRes.data ?? []) : []
     const newIdx = relocateChapterIndex(oldIdx, b.durChapterTitle, toc)
     if (newIdx < 0) return // 目录为空等异常：不动服务端进度
@@ -1006,7 +1023,8 @@ async function addRelated(r: RelatedBook) {
   try {
     await saveBook({
       bookUrl: r.bookUrl,
-      tocUrl: r.tocUrl || '',
+      // 同上：tocUrl 以 bookUrl 兜底，不落空
+      tocUrl: r.tocUrl || r.bookUrl,
       origin: r.origin,
       originName: r.originName,
       name: r.name,
