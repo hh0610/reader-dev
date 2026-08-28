@@ -6715,6 +6715,13 @@ async fn tts_synthesize(
         Bytes(Vec<u8>),
         ApiBytes(Vec<u8>, Option<String>),
     }
+    // 合成开始/完成打 INFO：整章首合成要 40~90 秒，此前成功零日志——
+    // 前端一直「加载中」时，卡没卡住、卡在哪只能猜（实测排障时反复吃这个亏）
+    let synth_started = std::time::Instant::now();
+    tracing::info!(
+        "tts 合成开始 [{engine_eff}] voice={voice} 文本 {} 字",
+        text.chars().count()
+    );
     let outcome = match engine_eff.as_str() {
         "edge" => crate::service::tts::edge_synthesize(
             &text,
@@ -6774,6 +6781,18 @@ async fn tts_synthesize(
         }
     };
 
+    if let Ok(o) = &outcome {
+        let bytes = match o {
+            TtsOutcome::Bytes(b) => b.len(),
+            TtsOutcome::ApiBytes(b, _) => b.len(),
+        };
+        tracing::info!(
+            "tts 合成完成 [{engine_eff}] {} 字 → {} KB，耗时 {}s",
+            text.chars().count(),
+            bytes / 1024,
+            synth_started.elapsed().as_secs()
+        );
+    }
     match outcome {
         Ok(TtsOutcome::Bytes(audio)) => {
             if base64_flag {
@@ -6811,7 +6830,10 @@ async fn tts_synthesize(
             }
         }
         Err(e) => {
-            tracing::warn!("tts 合成失败 [{engine_eff}]: {e}");
+            tracing::warn!(
+                "tts 合成失败 [{engine_eff}]（{}s 后）: {e}",
+                synth_started.elapsed().as_secs()
+            );
             Json(ReturnData::err("合成失败")).into_response()
         }
     }

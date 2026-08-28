@@ -1760,6 +1760,9 @@ let ttsAutoNext = false
   ttsRate.value = round1(loadSetting(TTS_RATE_KEY, 0.5, 2, 1, 0.1))
   ttsPitch.value = loadSetting(TTS_PITCH_KEY, -10, 10, 0)
   ttsVolume.value = loadSetting(TTS_VOLUME_KEY, 0, 200, 100)
+  // 迁移脚枪存量：音量 0 映射为 -100%（完全静音的音频）——没人想要一段无声朗读，
+  // 多半是「没声音 → 猛按音量减」按到底留下的（实测用户踩到）。≤10 一律复位默认。
+  if (ttsVolume.value <= 10) ttsVolume.value = 100
   // 风格选项已移除（Edge 免费端点不支持 express-as，选了会导致整章无音频）；
   // 存量 localStorage 值清空，后端亦已忽略该参数（双保险）
   ttsStyle.value = ''
@@ -5634,9 +5637,9 @@ onBeforeUnmount(() => {
               <button
                 class="set-btn"
                 type="button"
-                :disabled="ttsVolume <= 0"
-                title="降低音量"
-                @click="ttsVolume = Math.max(0, ttsVolume - 10)"
+                :disabled="ttsVolume <= 20"
+                title="降低音量（下限 -80%，不提供完全静音——那等于合成一段无声音频）"
+                @click="ttsVolume = Math.max(20, ttsVolume - 10)"
               >
                 −
               </button>
