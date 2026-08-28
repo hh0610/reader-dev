@@ -1891,8 +1891,35 @@ function ttsText(): string {
   return paragraphs.value.join('。').slice(0, TTS_MAX_CHARS)
 }
 
+/** 一段 44 字节的静音 WAV（0 采样 PCM）——手势内解锁 audio 元素用 */
+const SILENT_WAV =
+  'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA='
+
+/**
+ * 在用户手势内解锁 audio 元素（必须在 startTts 的**第一个 await 之前**调用）。
+ *
+ * 整章合成要 30~60 秒，等 blob 回来再 play() 时浏览器的用户手势早已过期，
+ * play 被自动播放策略拒绝——表现为「点了听书没有声音、进度也不动」，
+ * 且此前只是静默转为 paused，用户不知道还要再点一次。
+ * 标准解法：点击的同步调用栈里先播一段静音，audio 元素被手势"启动"过之后，
+ * 换 src 再 play 不再被拦（Chrome/Safari 均适用）。
+ */
+function unlockTtsAudio() {
+  const a = ttsAudioRef.value
+  if (!a) return
+  try {
+    a.src = SILENT_WAV
+    void a.play().catch(() => {
+      /* 无手势环境（如自动化）会拒——不影响后续 catch 兜底 */
+    })
+  } catch {
+    /* ignore */
+  }
+}
+
 /** 播放当前章：合成 → blob → audio 播放 */
 async function startTts() {
+  unlockTtsAudio() // 必须先于任何 await（手势有效期内）
   ttsSelectionMode = false // 整章朗读：结束允许自动连播
   const text = ttsText()
   if (!text) {
@@ -1944,8 +1971,12 @@ async function startTts() {
     await audio.play()
     startTtsParaTracking()
   } catch {
-    // 自动播放被拦截（异步 fetch 后手势已失效）：保持待播，面板点「播放」即可恢复
-    if (ttsState.value === 'playing') ttsState.value = 'paused'
+    // 自动播放仍被拦截（解锁失败的极端情况）：转待播并明确告诉用户下一步，
+    // 此前静默转 paused——用户只看到「没有声音、进度不动」，不知道要再点一次
+    if (ttsState.value === 'playing') {
+      ttsState.value = 'paused'
+      ElMessage.warning('浏览器拦截了自动播放，点面板「播放」开始朗读')
+    }
   }
 }
 
@@ -2001,7 +2032,11 @@ function toggleTts() {
 
 /** 本章播完：自动连播下一章；最后一章则停止；划词朗读播完即止 */
 function onTtsEnded() {
-  if (ttsState.value === 'idle') return
+  // 仅在真正播放中才处理。此前只挡 idle：loading 期间 unlockTtsAudio 的静音 WAV
+  // 播完立刻 ended → 这里误判「本章播完」→ 自动切下一章 → 连播标记又重启听书
+  // → 再解锁再 ended……无限切章，且每轮合成都被 seq 作废（实测踩到）。
+  // ended 不可能在 paused 状态触发，此守卫不影响正常连播。
+  if (ttsState.value !== 'playing') return
   stopTtsParaTracking()
   if (ttsObjectUrl) {
     URL.revokeObjectURL(ttsObjectUrl)
