@@ -1743,10 +1743,18 @@ const ttsPitch = ref(0)
 /** 音量百分比 0-200（100 = +0%） */
 const ttsVolume = ref(100)
 const ttsStyle = ref('')
-const ttsEngine = ref<'edge' | 'http'>('edge')
+const ttsEngine = ref<'edge' | 'http' | 'local'>('edge')
 /** HttpTTS 源名称（engine=http 时以 type=api&voice={名称} 按名分派合成） */
 const ttsHttpName = ref('')
 const ttsAudioRef = ref<HTMLAudioElement | null>(null)
+/* ---- 本地引擎（浏览器 Web Speech API）：即点即读、零网络零成本，音质取决于系统语音。
+   借鉴 booklore/foliate 的路线——朗读在客户端本地做，服务端只管进度；
+   与 Edge 引擎互补：Edge 音质好但整章要合成几十秒，本地零等待。 ---- */
+const TTS_LOCAL_VOICE_KEY = 'reader_tts_local_voice'
+const ttsLocalSupported = typeof window !== 'undefined' && 'speechSynthesis' in window
+const ttsLocalVoices = ref<SpeechSynthesisVoice[]>([])
+/** 本地音色（voiceURI；空 = 自动选第一个中文音色） */
+const ttsLocalVoice = ref('')
 /** 当前播放 blob 的 objectURL（换源/停止时 revoke） */
 let ttsObjectUrl = ''
 /** 合成请求序号：切章/停止时自增，丢弃过期结果 */
@@ -1767,7 +1775,8 @@ let ttsAutoNext = false
   // 存量 localStorage 值清空，后端亦已忽略该参数（双保险）
   ttsStyle.value = ''
   const e = localStorage.getItem(TTS_ENGINE_KEY)
-  if (e === 'edge' || e === 'http') ttsEngine.value = e
+  if (e === 'edge' || e === 'http' || (e === 'local' && ttsLocalSupported)) ttsEngine.value = e
+  ttsLocalVoice.value = localStorage.getItem(TTS_LOCAL_VOICE_KEY) ?? ''
   ttsHttpName.value = localStorage.getItem(TTS_HTTP_NAME_KEY) ?? ''
 }
 watch(ttsVoice, (v) => persist(TTS_VOICE_KEY, v))
@@ -1777,6 +1786,7 @@ watch(ttsVolume, (v) => persist(TTS_VOLUME_KEY, v))
 watch(ttsStyle, (v) => persist(TTS_STYLE_KEY, v))
 watch(ttsEngine, (v) => persist(TTS_ENGINE_KEY, v))
 watch(ttsHttpName, (v) => persist(TTS_HTTP_NAME_KEY, v))
+watch(ttsLocalVoice, (v) => persist(TTS_LOCAL_VOICE_KEY, v))
 
 /** 播放中（顶栏按钮高亮） */
 const ttsPlaying = computed(() => ttsState.value === 'playing')
@@ -1851,6 +1861,25 @@ const ttsLocaleGroups = computed(() => {
   return Array.from(map.entries()).map(([label, voices]) => ({ label, voices }))
 })
 
+/** 本地音色列表：中文排前。getVoices() 可能先返回空、待 voiceschanged 才就绪 */
+function loadLocalVoices() {
+  if (!ttsLocalSupported) return
+  const pick = () => {
+    const all = window.speechSynthesis.getVoices()
+    if (all.length === 0) return
+    const zh = all.filter((v) => v.lang.toLowerCase().startsWith('zh'))
+    const rest = all.filter((v) => !v.lang.toLowerCase().startsWith('zh'))
+    ttsLocalVoices.value = [...zh, ...rest]
+    if (!ttsLocalVoice.value || !all.some((v) => v.voiceURI === ttsLocalVoice.value)) {
+      ttsLocalVoice.value = (zh[0] ?? all[0]).voiceURI
+    }
+  }
+  pick()
+  if (ttsLocalVoices.value.length === 0) {
+    window.speechSynthesis.addEventListener('voiceschanged', pick, { once: true })
+  }
+}
+
 /** 首次打开面板时加载语音列表 + HttpTTS 列表（记忆值失效时回退默认） */
 async function loadTtsOptions() {
   if (!ttsVoicesLoaded.value) {
@@ -1883,7 +1912,10 @@ async function loadTtsOptions() {
   }
 }
 watch(ttsPanelOpen, (open) => {
-  if (open) void loadTtsOptions()
+  if (open) {
+    void loadTtsOptions()
+    loadLocalVoices()
+  }
 })
 
 /** 朗读文本：正文段落（含替换规则/简繁转换），截断到后端上限；EPUB HTML 模式回退去标签纯文本 */
@@ -1892,6 +1924,123 @@ function ttsText(): string {
     return chapterPlainText().replace(/\s*\n+\s*/g, '。').slice(0, TTS_MAX_CHARS)
   }
   return paragraphs.value.join('。').slice(0, TTS_MAX_CHARS)
+}
+
+/* ---------------- 本地引擎播放核心 ----------------
+ * 逐段 speak：每段一个 utterance——天然绕开 Chrome 长 utterance 被截断的老 bug，
+ * 且段落边界即高亮边界（比 Edge 流的「按视口 32% 线估算当前段」精确得多）。
+ * 超长段落再按句切（≤200 字/utterance）。所有回调用 ttsLoadSeq 防过期。 */
+
+/** 段内按句切块（。！？!?；; 边界；超长兜底硬切） */
+function splitForUtterance(text: string, max = 200): string[] {
+  const out: string[] = []
+  let buf = ''
+  for (const piece of text.split(/(?<=[。！？!?；;])/)) {
+    if (buf.length + piece.length > max && buf) {
+      out.push(buf)
+      buf = piece
+    } else {
+      buf += piece
+    }
+  }
+  if (buf.trim()) out.push(buf)
+  // 单句仍超长（无标点的长串）：硬切
+  return out.flatMap((c) => {
+    const r: string[] = []
+    for (let i = 0; i < c.length; i += max) r.push(c.slice(i, i + max))
+    return r
+  })
+}
+
+function localVoiceObj(): SpeechSynthesisVoice | null {
+  return ttsLocalVoices.value.find((v) => v.voiceURI === ttsLocalVoice.value) ?? null
+}
+
+/**
+ * 本地朗读一组段落。paraIdx 提供时逐段高亮 + 温和滚动跟随；
+ * 结束后走与 Edge 流同一个 onTtsEnded（连播/划词语义一致）。
+ */
+function startLocalTts(paras: string[], opts: { selection?: boolean } = {}) {
+  const synth = window.speechSynthesis
+  synth.cancel() // 打断上一轮（含切章重读）
+  const seq = ++ttsLoadSeq
+  ttsSelectionMode = !!opts.selection
+  ttsState.value = 'playing'
+  stopTtsParaTracking() // 本地引擎自己精确驱动高亮，不用滚动估算定时器
+
+  // (段落文本, 原始段落下标) 清单——空段跳过但下标要对得上高亮
+  const items: Array<{ text: string; para: number }> = []
+  paras.forEach((t, i) => {
+    const trimmed = t.trim()
+    if (trimmed) items.push({ text: trimmed, para: opts.selection ? -1 : i })
+  })
+  if (items.length === 0) {
+    ttsState.value = 'idle'
+    ElMessage.info('本章暂无内容可朗读')
+    return
+  }
+
+  const voice = localVoiceObj()
+  let idx = 0
+  const speakNext = () => {
+    if (seq !== ttsLoadSeq) return // 已停止/切章/换引擎
+    if (idx >= items.length) {
+      // 与 Edge 流共用章节结束语义（连播下一章 / 划词即止）
+      onTtsEnded()
+      return
+    }
+    const item = items[idx++]
+    if (item.para >= 0) {
+      ttsReadingPara.value = item.para
+      // 温和跟随：把正在读的段落带到视口内（用户手动滚走也只在换段时拉回）
+      document
+        .querySelectorAll<HTMLElement>('.reader-content .reader-para')
+        [item.para]?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    }
+    const chunks = splitForUtterance(item.text)
+    let ci = 0
+    const speakChunk = () => {
+      if (seq !== ttsLoadSeq) return
+      if (ci >= chunks.length) {
+        speakNext()
+        return
+      }
+      // 整段 try/catch 兜底：utterance 构造/属性赋值在个别环境会抛
+      // （实测：voice setter 收到非原生对象直接 TypeError）——不兜底就
+      // 静默卡死在 playing 态，没声音也没提示
+      try {
+        const u = new SpeechSynthesisUtterance(chunks[ci++])
+        try {
+          if (voice) u.voice = voice
+        } catch {
+          /* 音色对象不被接受：用系统默认音色继续 */
+        }
+        u.rate = ttsRate.value // 0.5~2 与 Web Speech 语义直接对应
+        u.pitch = Math.min(2, Math.max(0, 1 + ttsPitch.value / 10)) // ±10 → 0~2
+        u.volume = Math.min(1, ttsVolume.value / 100) // >100% 系统不支持增益，封顶 1
+        u.onend = speakChunk
+        u.onerror = (e) => {
+          // cancel() 触发的 interrupted/canceled 属正常打断；其余错误跳过本块继续
+          if (seq !== ttsLoadSeq) return
+          if (e.error === 'not-allowed') {
+            // 页面从未有过用户交互时 Chrome 拒绝 speak——转待播，点面板「播放」即恢复
+            ttsState.value = 'paused'
+            ElMessage.warning('浏览器拦截了自动朗读，点面板「播放」开始')
+            return
+          }
+          if (e.error !== 'interrupted' && e.error !== 'canceled') speakChunk()
+        }
+        synth.speak(u)
+      } catch (e) {
+        if (seq !== ttsLoadSeq) return
+        ttsState.value = 'idle'
+        stopTtsParaTracking()
+        ElMessage.error(e instanceof Error ? `本地朗读失败：${e.message}` : '本地朗读失败')
+      }
+    }
+    speakChunk()
+  }
+  speakNext()
 }
 
 /** 一段 44 字节的静音 WAV（0 采样 PCM）——手势内解锁 audio 元素用 */
@@ -1920,8 +2069,19 @@ function unlockTtsAudio() {
   }
 }
 
-/** 播放当前章：合成 → blob → audio 播放 */
+/** 播放当前章：本地引擎即点即读；Edge/HttpTTS 合成 → blob → audio 播放 */
 async function startTts() {
+  if (ttsEngine.value === 'local') {
+    // 本地引擎零合成零等待。EPUB HTML 模式无段落映射 → 整文切块朗读（不高亮）
+    ttsSelectionMode = false
+    loadLocalVoices()
+    if (epubHtmlActive.value) {
+      startLocalTts([ttsText()], { selection: false })
+    } else {
+      startLocalTts([...paragraphs.value])
+    }
+    return
+  }
   unlockTtsAudio() // 必须先于任何 await（手势有效期内）
   ttsSelectionMode = false // 整章朗读：结束允许自动连播
   const text = ttsText()
@@ -1989,6 +2149,7 @@ function stopTts() {
   ttsSelectionMode = false
   ttsState.value = 'idle'
   stopTtsParaTracking()
+  if (ttsLocalSupported) window.speechSynthesis.cancel()
   const audio = ttsAudioRef.value
   if (audio) {
     audio.pause()
@@ -2002,19 +2163,43 @@ function stopTts() {
 }
 
 function pauseTts() {
+  if (ttsState.value !== 'playing') return
+  if (ttsEngine.value === 'local') {
+    window.speechSynthesis.pause()
+    ttsState.value = 'paused'
+    return // 高亮保留（本地引擎不走定时器）
+  }
   const audio = ttsAudioRef.value
-  if (!audio || ttsState.value !== 'playing') return
+  if (!audio) return
   audio.pause()
   ttsState.value = 'paused'
   pauseTtsParaTracking()
 }
 
 function resumeTts() {
+  if (ttsState.value !== 'paused') return
+  if (ttsEngine.value === 'local') {
+    // not-allowed 转入的待播：speaking 为假，resume 无效 → 直接重新开讲
+    if (window.speechSynthesis.paused) {
+      window.speechSynthesis.resume()
+      ttsState.value = 'playing'
+    } else {
+      void startTts()
+    }
+    return
+  }
   const audio = ttsAudioRef.value
-  if (!audio || ttsState.value !== 'paused') return
-  void audio.play().catch(() => {
-    /* 保持暂停 */
-  })
+  if (!audio) return
+  void audio
+    .play()
+    .then(() => {
+      // 既有缺陷补正：此前恢复成功也不回置状态，按钮一直显示「播放」，
+      // 再点会重复 resume 而不是暂停
+      ttsState.value = 'playing'
+    })
+    .catch(() => {
+      /* 保持暂停 */
+    })
   startTtsParaTracking()
 }
 
@@ -2133,6 +2318,11 @@ let ttsSelectionMode = false
 async function speakText(text: string) {
   const clipped = text.slice(0, TTS_MAX_CHARS)
   if (!clipped.trim()) return
+  if (ttsEngine.value === 'local') {
+    loadLocalVoices()
+    startLocalTts([clipped], { selection: true })
+    return
+  }
   await loadTtsOptions()
   const audio = ttsAudioRef.value
   if (!audio) return
@@ -5552,6 +5742,16 @@ onBeforeUnmount(() => {
               <button
                 class="seg-btn"
                 type="button"
+                :class="{ active: ttsEngine === 'local' }"
+                :disabled="!ttsLocalSupported"
+                :title="ttsLocalSupported ? '浏览器本地语音：即点即读，无需等待合成；音质取决于系统语音' : '当前浏览器不支持 Web Speech API'"
+                @click="ttsEngine = 'local'"
+              >
+                本地
+              </button>
+              <button
+                class="seg-btn"
+                type="button"
                 :class="{ active: ttsEngine === 'http' }"
                 :disabled="ttsHttpList.length === 0"
                 :title="ttsHttpList.length === 0 ? '未配置 HttpTTS 源（设置页添加）' : ''"
@@ -5569,7 +5769,17 @@ onBeforeUnmount(() => {
             </select>
           </div>
 
-          <div class="set-row">
+          <div v-if="ttsEngine === 'local'" class="set-row">
+            <span class="set-label">音色</span>
+            <select v-model="ttsLocalVoice" class="tts-select" :title="ttsLocalVoice">
+              <option v-for="v in ttsLocalVoices" :key="v.voiceURI" :value="v.voiceURI">
+                {{ v.name }} · {{ v.lang }}
+              </option>
+              <option v-if="ttsLocalVoices.length === 0" value="">（系统无可用语音）</option>
+            </select>
+          </div>
+
+          <div v-else class="set-row">
             <span class="set-label">音色</span>
             <select v-model="ttsVoice" class="tts-select" :title="ttsVoice">
               <optgroup v-for="g in ttsLocaleGroups" :key="g.label" :label="g.label">
