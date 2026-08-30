@@ -544,10 +544,16 @@ async function clearCustomFont() {
   customFontEnabled.value = false
   ElMessage.success('已移除自定义字体')
 }
-// 点击其他区域关闭字体下拉
+/** 窄屏顶栏「菜单」下拉（宽屏按钮直接铺开，此状态无效果——按钮由 CSS 隐藏） */
+const topMenuOpen = ref(false)
+
+// 点击其他区域关闭字体下拉 / 顶栏菜单下拉
 function onDocClick(e: MouseEvent) {
   if (fontOpen.value && !(e.target as HTMLElement)?.closest('.font-picker')) {
     fontOpen.value = false
+  }
+  if (topMenuOpen.value && !(e.target as HTMLElement)?.closest('.topbar')) {
+    topMenuOpen.value = false
   }
 }
 onMounted(() => document.addEventListener('mousedown', onDocClick))
@@ -728,7 +734,9 @@ function slideFlip(dir: 1 | -1) {
   window.scrollBy({ top: dir * window.innerHeight * SLIDE_PAGE, behavior: 'smooth' })
 }
 function isInsideOverlay(el: EventTarget | null): boolean {
-  return el instanceof HTMLElement && !!el.closest('.drawer-mask, .pop-mask, .sel-bar')
+  // .topbar：顶部菜单栏整体豁免——用户实测在按钮条上横向拖动（想滚动看更多按钮）
+  // 被 window 级横滑手势误判为翻章（视频复现）。顶栏上的任何拖动都不该翻页/翻章。
+  return el instanceof HTMLElement && !!el.closest('.drawer-mask, .pop-mask, .sel-bar, .topbar')
 }
 function onWheel(e: WheelEvent) {
   if (isInsideOverlay(e.target)) return
@@ -4325,7 +4333,27 @@ onBeforeUnmount(() => {
 
       <span class="book-name" :title="displayBookName">{{ displayBookName || t('reader.title') }}</span>
 
-      <div class="top-actions">
+      <!-- 窄屏专用：点击展开操作菜单（宽屏由 CSS 隐藏此按钮、按钮条直接铺开）。
+           此前窄屏按钮条横向滚动，拖动它会被误判为翻章手势 -->
+      <button
+        class="icon-btn top-menu-btn"
+        type="button"
+        :title="topMenuOpen ? '收起菜单' : '展开菜单'"
+        :aria-expanded="topMenuOpen"
+        @click="topMenuOpen = !topMenuOpen"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 7h16" />
+          <path d="M4 12h16" />
+          <path d="M4 17h16" />
+        </svg>
+      </button>
+
+      <div
+        class="top-actions"
+        :class="{ open: topMenuOpen }"
+        @click="(e) => { if (!(e.target as HTMLElement)?.closest('.keep-open')) topMenuOpen = false }"
+      >
         <button class="font-btn" type="button" title="书籍详情（换源 / 缓存 / 编辑）" @click="router.push(`/book/${encodeURIComponent(bookUrl)}`)">
           详情
         </button>
@@ -4340,7 +4368,7 @@ onBeforeUnmount(() => {
         </button>
         <button
           v-if="isTextBook"
-          class="font-btn"
+          class="font-btn keep-open"
           type="button"
           :disabled="fontSize <= MIN_FONT"
           :title="t('reader.fontDec')"
@@ -4350,7 +4378,7 @@ onBeforeUnmount(() => {
         </button>
         <button
           v-if="isTextBook"
-          class="font-btn"
+          class="font-btn keep-open"
           type="button"
           :disabled="fontSize >= MAX_FONT"
           :title="t('reader.fontInc')"
@@ -6285,6 +6313,10 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   flex-shrink: 0;
+}
+/* 「菜单」按钮仅窄屏出现（宽屏按钮条直接铺开，无需收纳） */
+.top-menu-btn {
+  display: none;
 }
 .font-btn {
   min-width: 34px;
@@ -8476,18 +8508,28 @@ onBeforeUnmount(() => {
     flex: 1;
     font-size: 13px;
   }
-  /* 顶部操作栏：第二行整宽，横向滚动（触屏滑动），按钮不压缩 */
-  .top-actions {
+  /* 顶部操作栏：由横向滚动条改为「菜单」按钮点击下拉（横滚条要拖动，
+     拖动曾被误判为翻章手势——用户视频实测；下拉面板换行铺开，一眼全览） */
+  .top-menu-btn {
+    display: inline-flex;
     order: 3;
-    width: 100%;
-    gap: 6px;
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-    padding-bottom: 2px;
   }
-  .top-actions::-webkit-scrollbar {
+  .top-actions {
     display: none;
+  }
+  .top-actions.open {
+    display: flex;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 30;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 10px 12px 12px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
   }
   .top-actions .font-btn,
   .top-actions .toc-btn {
