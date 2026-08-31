@@ -1,21 +1,17 @@
 name: Publish Rust Release
-
 on:
   push:
     tags:
       - 'v5.*'
   workflow_dispatch:
-
 permissions:
   contents: write
   packages: write
-
 concurrency:
   group: docker-publish-rust
   cancel-in-progress: true
-
 jobs:
-  # ================= Docker 镜像（GHCR + Docker Hub）——release 二进制见 release-rust.yml =================
+  # ================= Docker 镜像（仅GHCR，移除Docker Hub） =================
   docker:
     runs-on: ubuntu-latest
     steps:
@@ -24,10 +20,7 @@ jobs:
       - name: Setup buildx（hosted runner 预装 docker——buildx 插件标准化）
         uses: docker/setup-buildx-action@v3
       - name: 登录 GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-      - name: 登录 Docker Hub
-        run: |
-          echo "${{ secrets.DOCKERHUB_PASSWORD }}" | docker login -u ${{ secrets.DOCKERHUB_USERNAME }} --password-stdin
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ shturl.cc/W2 }} --password-stdin
       - name: 构建并推送 amd64 镜像（type=gha 缓存——GitHub Actions cache 跨 run 持久）
         run: |
           docker buildx build \
@@ -37,6 +30,4 @@ jobs:
             --cache-to type=gha,mode=max \
             -t ghcr.io/${{ github.repository }}:latest \
             -t ghcr.io/${{ github.repository }}:${{ github.ref_name }} \
-            -t ${{ secrets.DOCKERHUB_USERNAME }}/reader-dev:latest \
-            -t ${{ secrets.DOCKERHUB_USERNAME }}/reader-dev:${{ github.ref_name }} \
             .
