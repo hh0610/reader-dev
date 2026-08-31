@@ -10,18 +10,21 @@ permissions:
 concurrency:
   group: docker-publish-rust
   cancel-in-progress: true
+
 jobs:
-  # ================= Docker 镜像（仅GHCR，移除Docker Hub） =================
   docker:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Setup buildx（hosted runner 预装 docker——buildx 插件标准化）
+
+      - name: Setup buildx
         uses: docker/setup-buildx-action@v3
-      - name: 登录 GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ shturl.cc/W2 }} --password-stdin
-      - name: 构建并推送 amd64 镜像（type=gha 缓存——GitHub Actions cache 跨 run 持久）
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build & Push amd64
         run: |
           docker buildx build \
             --platform linux/amd64 \
